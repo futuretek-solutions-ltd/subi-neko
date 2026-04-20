@@ -1,0 +1,48 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    #env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+
+      # Directory where source MKV files are placed for import
+      - IMPORT_ROOT=./media/import
+
+      # Directory where finished output files are written
+      - OUTPUT_ROOT=./media/output
+
+      # Directory for the SQLite database
+      - CONFIG_ROOT=./config
+
+    volumes:
+      - ./media:/app/media
+      - ./config:/app/config
+
+#    depends_on:
+#      korektor:
+#        condition: service_healthy
+#      languagetool:
+#        condition: service_healthy
+
+  # Spellcheck: Czech language
+#  korektor:
+#    image: ghcr.io/futuretek-solutions-ltd/docker-korektor
+#    ports:
+#      - "8010:8010"
+
+  # Spellcheck: multiple languages supported
+#  languagetool:
+#    image: erikvl87/languagetool
+#    ports:
+#      - "8010:8010"
+#    environment:
+#      - Java_Xms=512m
+#      - Java_Xmx=1g
+#    healthcheck:
+#      test: ["CMD-SHELL", "wget -q --spider http://localhost:8010/v2/languages || exit 1"]
+#      interval: 30s
+#      timeout: 10s
+#      retries: 5
+#      start_period: 60s

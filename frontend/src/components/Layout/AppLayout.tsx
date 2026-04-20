@@ -1,0 +1,859 @@
+import { useState } from 'react';
+import {
+  ActionIcon,
+  AppShell,
+  Badge,
+  Box,
+  Button,
+  Card,
+  Center,
+  Group,
+  HoverCard,
+  Image,
+  Loader,
+  Modal,
+  ScrollArea,
+  Stack,
+  Table,
+  Text,
+  Title,
+  UnstyledButton,
+  useMantineTheme,
+} from '@mantine/core';
+import {
+  ArrowClockwiseIcon,
+  CaretDown,
+  CaretRight,
+  CheckCircle,
+  Clock,
+  Gear,
+  MinusCircle,
+  NotePencil,
+  Pause,
+  Play,
+  Plus,
+  SpinnerGap,
+  Stop,
+  Trash,
+  Warning,
+  XCircle,
+} from '@phosphor-icons/react';
+import type { ChunkJob, FileStatus, Project, SubtitleChunk, VideoFile } from '../../types';
+import { useProjects, useProjectFiles, useFileChunks, useDeleteProject, usePauseProject, useResumeProject, useRetryChunk } from '../../hooks/useProjects';
+import { OptionsDrawer } from '../../pages/OptionsDrawer';
+import { ImportDialog } from '../../pages/ImportDialog';
+import { CharacterMappingDialog } from '../../pages/CharacterMappingDialog';
+import { SubtitleEditorDialog } from '../../pages/SubtitleEditorDialog';
+import { ActiveJobsPanel } from '../Jobs/ActiveJobsPanel';
+import { ProjectPipeline } from '../Project/ProjectPipeline';
+import posterUrl from '../../assets/poster.png';
+
+// ─── Status dot colors ────────────────────────────────────────────────────────
+
+function getProjectDotColor(project: Project): string {
+  if (project.status === 'failed') return 'var(--mantine-color-red-5)';
+  if (project.is_paused || project.status === 'waiting_for_mapping' || project.status === 'review_required')
+    return 'var(--mantine-color-yellow-5)';
+  if (project.status === 'completed') return 'var(--mantine-color-green-5)';
+  return 'var(--mantine-color-cyan-4)'; // new / discovering / processing
+}
+
+// ─── Status badge colors ──────────────────────────────────────────────────────
+
+const FILE_STATUS_COLORS: Record<FileStatus, string> = {
+  new: 'gray',
+  discovering: 'cyan',
+  waiting: 'yellow',
+  ready: 'blue',
+  processing: 'indigo',
+  review_required: 'orange',
+  muxing: 'violet',
+  completed: 'green',
+  paused: 'gray',
+  failed: 'red',
+};
+
+const PROJECT_STATUS_COLORS: Record<string, string> = {
+  new: 'gray',
+  discovering: 'cyan',
+  waiting_for_mapping: 'yellow',
+  processing: 'blue',
+  review_required: 'orange',
+  completed: 'green',
+  failed: 'red',
+};
+
+// ─── Chunk panel ──────────────────────────────────────────────────────────────
+
+type PipelineTone = 'waiting' | 'queued' | 'processing' | 'done' | 'failed' | 'not-needed' | 'issues';
+
+interface PipelineBadge {
+  label: string;
+  tone: PipelineTone;
+  jobType?: string;
+  job?: ChunkJob;
+}
+
+const PIPELINE_COLORS: Record<PipelineTone, string> = {
+  waiting: 'gray',
+  queued: 'gray',
+  processing: 'blue',
+  done: 'green',
+  failed: 'red',
+  'not-needed': 'gray',
+  issues: 'yellow',
+};
+
+const COMPLETE_AFTER_VALIDATE = new Set(['validated', 'rules_reviewed', 'grammar_reviewed', 'languagetool_reviewed', 'llm_reviewed', 'complete']);
+const COMPLETE_AFTER_RULES = new Set(['rules_reviewed', 'grammar_reviewed', 'languagetool_reviewed', 'llm_reviewed', 'complete']);
+const COMPLETE_AFTER_GRAMMAR = new Set(['grammar_reviewed', 'languagetool_reviewed', 'llm_reviewed', 'complete']);
+
+function isProcessing(job?: ChunkJob) {
+  return job?.status === 'running';
+}
+
+function isQueued(job?: ChunkJob) {
+  return job?.status === 'queued';
+}
+
+function isCompleted(job?: ChunkJob) {
+  return job?.status === 'completed';
+}
+
+function numberResult(job: ChunkJob | undefined, key: string): number | null {
+  const value = job?.result?.[key];
+  return typeof value === 'number' ? value : null;
+}
+
+function labelWithRuns(label: string, job?: ChunkJob) {
+  return job && job.attempt_count > 1 ? `${label} (${job.attempt_count}x)` : label;
+}
+
+function statusTooltip(badge: PipelineBadge) {
+  const parts = [badge.jobType ? `Job: ${badge.jobType}` : null];
+  if (badge.job) {
+    const lastRun = badge.job.finished_at ?? badge.job.started_at ?? badge.job.scheduled_at;
+    parts.push(`Status: ${badge.job.status}`);
+    parts.push(`Attempts: ${badge.job.attempt_count}`);
+    parts.push(`Last run: ${new Date(lastRun).toLocaleString()}`);
+    if (badge.job.error_code) parts.push(`Error: ${badge.job.error_code}`);
+    if (badge.job.error_message) parts.push(badge.job.error_message);
+  }
+  return parts.filter(Boolean).join('\n') || badge.label;
+}
+
+function PipelineStatus({ badge }: { badge: PipelineBadge }) {
+  const color = PIPELINE_COLORS[badge.tone];
+  const iconColor = `var(--mantine-color-${color}-5)`;
+  const Icon = {
+    waiting: Clock,
+    queued: Clock,
+    processing: SpinnerGap,
+    done: CheckCircle,
+    failed: XCircle,
+    'not-needed': MinusCircle,
+    issues: Warning,
+  }[badge.tone];
+
+  return (
+    <Group gap={4} wrap="nowrap" title={statusTooltip(badge)}>
+      <Icon size={13} color={iconColor} weight={badge.tone === 'processing' ? 'bold' : 'regular'} />
+      <Text size="xs" c={color} lh={1} truncate>
+        {badge.label}
+      </Text>
+    </Group>
+  );
+}
+
+function chunkJob(chunk: SubtitleChunk, jobType: string) {
+  return chunk.jobs?.[jobType];
+}
+
+function translateBadge(chunk: SubtitleChunk): PipelineBadge {
+  const job = chunkJob(chunk, 'translate_chunk');
+  if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'translate_chunk', job };
+  if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'translate_chunk', job };
+  if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'translate_chunk', job };
+  if (isCompleted(job) || chunk.status !== 'pending') return { label: labelWithRuns('Done', job), tone: 'done', jobType: 'translate_chunk', job };
+  return { label: 'Waiting', tone: 'waiting', jobType: 'translate_chunk', job };
+}
+
+function validateBadge(chunk: SubtitleChunk): PipelineBadge {
+  const job = chunkJob(chunk, 'validate_chunk');
+  if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'validate_chunk', job };
+  if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'validate_chunk', job };
+  if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'validate_chunk', job };
+  if (isCompleted(job)) {
+    const valid = job.result?.valid;
+    if (valid === false) return { label: labelWithRuns('Rejected', job), tone: 'issues', jobType: 'validate_chunk', job };
+    return { label: labelWithRuns('Done', job), tone: 'done', jobType: 'validate_chunk', job };
+  }
+  if (COMPLETE_AFTER_VALIDATE.has(chunk.status)) return { label: labelWithRuns('Done', job), tone: 'done', jobType: 'validate_chunk', job };
+  return { label: 'Waiting', tone: 'waiting', jobType: 'validate_chunk', job };
+}
+
+function fixBadge(chunk: SubtitleChunk): PipelineBadge {
+  const job = chunkJob(chunk, 'repair_chunk');
+  if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'repair_chunk', job };
+  if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'repair_chunk', job };
+  if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'repair_chunk', job };
+  if (isCompleted(job)) return { label: labelWithRuns('Done', job), tone: 'done', jobType: 'repair_chunk', job };
+  if (validateBadge(chunk).tone === 'done') return { label: 'Not needed', tone: 'not-needed', jobType: 'repair_chunk', job };
+  return { label: 'Waiting', tone: 'waiting', jobType: 'repair_chunk', job };
+}
+
+function rulesBadge(chunk: SubtitleChunk): PipelineBadge {
+  const job = chunkJob(chunk, 'review_chunk_rules');
+  const warnings = numberResult(job, 'warnings_created') ?? 0;
+  if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'review_chunk_rules', job };
+  if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'review_chunk_rules', job };
+  if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'review_chunk_rules', job };
+  if (isCompleted(job)) return warnings > 0
+    ? { label: `Issues (${warnings})`, tone: 'issues', jobType: 'review_chunk_rules', job }
+    : { label: labelWithRuns('Done', job), tone: 'done', jobType: 'review_chunk_rules', job };
+  if (!COMPLETE_AFTER_VALIDATE.has(chunk.status)) return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_rules', job };
+  if (COMPLETE_AFTER_RULES.has(chunk.status)) return { label: 'Done', tone: 'done', jobType: 'review_chunk_rules', job };
+  return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_rules', job };
+}
+
+function grammarBadge(chunk: SubtitleChunk): PipelineBadge {
+  const job = chunkJob(chunk, 'review_chunk_grammar') ?? chunkJob(chunk, 'review_chunk_languagetool');
+  const warnings = numberResult(job, 'warnings_created') ?? 0;
+  if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'review_chunk_grammar', job };
+  if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'review_chunk_grammar', job };
+  if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'review_chunk_grammar', job };
+  if (isCompleted(job)) {
+    return warnings > 0
+      ? { label: `Issues (${warnings})`, tone: 'issues', jobType: 'review_chunk_grammar', job }
+      : { label: labelWithRuns('Done', job), tone: 'done', jobType: 'review_chunk_grammar', job };
+  }
+  if (COMPLETE_AFTER_GRAMMAR.has(chunk.status)) return { label: 'Done', tone: 'done', jobType: 'review_chunk_grammar', job };
+  return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_grammar', job };
+}
+
+function aiReviewBadge(chunk: SubtitleChunk): PipelineBadge {
+  const job = chunkJob(chunk, 'review_chunk_llm');
+  if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'review_chunk_llm', job };
+  if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'review_chunk_llm', job };
+  if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'review_chunk_llm', job };
+  if (isCompleted(job) || chunk.status === 'llm_reviewed') return { label: labelWithRuns('Done', job), tone: 'done', jobType: 'review_chunk_llm', job };
+  if (!chunk.llm_review_needed && COMPLETE_AFTER_GRAMMAR.has(chunk.status)) {
+    return { label: 'Not needed', tone: 'not-needed', jobType: 'review_chunk_llm', job };
+  }
+  const grammar = grammarBadge(chunk);
+  if (grammar.tone === 'done' || grammar.tone === 'not-needed') {
+    return chunk.llm_review_needed
+      ? { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_llm', job }
+      : { label: 'Not needed', tone: 'not-needed', jobType: 'review_chunk_llm', job };
+  }
+  return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_llm', job };
+}
+
+function isQaCompleted(chunk: SubtitleChunk) {
+  return Boolean(
+    chunkJob(chunk, 'validate_chunk')?.status === 'completed'
+    || chunkJob(chunk, 'review_chunk_rules')?.status === 'completed'
+    || chunkJob(chunk, 'review_chunk_grammar')?.status === 'completed'
+    || chunkJob(chunk, 'review_chunk_languagetool')?.status === 'completed'
+    || chunkJob(chunk, 'review_chunk_llm')?.status === 'completed'
+    || COMPLETE_AFTER_VALIDATE.has(chunk.status)
+  );
+}
+
+function IssuesCell({ chunk }: { chunk: SubtitleChunk }) {
+  if (!isQaCompleted(chunk)) {
+    return <PipelineStatus badge={{ label: 'Waiting', tone: 'waiting' }} />;
+  }
+
+  if (chunk.qa_errors === 0 && chunk.qa_warnings === 0) {
+    return <Text size="xs" c="dimmed">0</Text>;
+  }
+
+  return (
+    <Group gap={6} wrap="nowrap">
+      {chunk.qa_errors > 0 && (
+        <Group gap={2} wrap="nowrap">
+          <Stop size={12} color="var(--mantine-color-red-5)" weight="fill" />
+          <Text size="xs" c="red" lh={1}>{chunk.qa_errors}</Text>
+        </Group>
+      )}
+      {chunk.qa_warnings > 0 && (
+        <Group gap={2} wrap="nowrap">
+          <Warning size={12} color="var(--mantine-color-yellow-5)" weight="fill" />
+          <Text size="xs" c="yellow" lh={1}>{chunk.qa_warnings}</Text>
+        </Group>
+      )}
+    </Group>
+  );
+}
+
+function FileIssuesCell({ file }: { file: VideoFile }) {
+  if (file.qa_issues <= 0) return <Text size="xs" c="dimmed">—</Text>;
+  return (
+    <Group gap={6} wrap="nowrap">
+      {file.qa_errors > 0 && (
+        <Group gap={2} wrap="nowrap">
+          <Stop size={12} color="var(--mantine-color-red-5)" weight="fill" />
+          <Text size="xs" c="red" lh={1}>{file.qa_errors}</Text>
+        </Group>
+      )}
+      {file.qa_warnings > 0 && (
+        <Group gap={2} wrap="nowrap">
+          <Warning size={12} color="var(--mantine-color-yellow-5)" weight="fill" />
+          <Text size="xs" c="yellow" lh={1}>{file.qa_warnings}</Text>
+        </Group>
+      )}
+    </Group>
+  );
+}
+
+// ─── Chunk status cell (failure states + retry) ───────────────────────────────
+
+const CHUNK_STATUS_LABELS: Record<string, { label: string; color: string }> = {
+  job_failed:             { label: 'Job failed',         color: 'red' },
+  validate_trans_failed:  { label: 'Needs repair',       color: 'yellow' },
+  validate_repair_failed: { label: 'Validation failed',  color: 'red' },
+};
+
+function ChunkStatusBadge({ chunk }: { chunk: SubtitleChunk }) {
+  const info = CHUNK_STATUS_LABELS[chunk.status];
+  if (!info) return null;
+
+  if (chunk.status === 'job_failed' && chunk.last_error_message) {
+    return (
+      <HoverCard width={280} shadow="md" withArrow openDelay={200}>
+        <HoverCard.Target>
+          <Badge color={info.color} variant="light" size="xs" style={{ cursor: 'default' }}>
+            {info.label}
+          </Badge>
+        </HoverCard.Target>
+        <HoverCard.Dropdown>
+          <Stack gap={4}>
+            {chunk.last_error_code && (
+              <Text size="xs" fw={600} c="red">{chunk.last_error_code}</Text>
+            )}
+            <Text size="xs" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+              {chunk.last_error_message}
+            </Text>
+          </Stack>
+        </HoverCard.Dropdown>
+      </HoverCard>
+    );
+  }
+
+  return (
+    <Badge color={info.color} variant="light" size="xs">
+      {info.label}
+    </Badge>
+  );
+}
+
+function ChunkRetryButton({
+  chunk,
+  projectId,
+  fileId,
+}: {
+  chunk: SubtitleChunk;
+  projectId: number;
+  fileId: number;
+}) {
+  const retryMutation = useRetryChunk(projectId, fileId);
+  const canRetry = chunk.status === 'job_failed' || chunk.status === 'validate_repair_failed';
+  if (!canRetry) return null;
+
+  return (
+    <Button
+      size="compact-xs"
+      variant="filled"
+      color="blue"
+      leftSection={<ArrowClockwiseIcon size={11} />}
+      loading={retryMutation.isPending}
+      onClick={() => retryMutation.mutate(chunk.chunk_index)}
+    >
+      Retry
+    </Button>
+  );
+}
+
+function FileChunksPanel({ projectId, fileId }: { projectId: number; fileId: number }) {
+  const { data: chunks, isLoading } = useFileChunks(projectId, fileId, true);
+
+  if (isLoading) return <Center py="xs"><Loader size="xs" /></Center>;
+  if (!chunks?.length) return <Text size="xs" c="dimmed" py="xs">No chunks yet.</Text>;
+
+  return (
+    <ScrollArea type="auto" offsetScrollbars>
+      <Table fz="xs" withColumnBorders={false} style={{ minWidth: 1105, tableLayout: 'fixed' }}>
+      <Table.Thead>
+        <Table.Tr>
+          <Table.Th style={{ width: 40 }}>#</Table.Th>
+          <Table.Th style={{ width: 90 }}>Lines</Table.Th>
+          <Table.Th style={{ width: 140 }}>Model</Table.Th>
+          <Table.Th style={{ width: 92 }}>Translate</Table.Th>
+          <Table.Th style={{ width: 92 }}>Validate</Table.Th>
+          <Table.Th style={{ width: 92 }}>Fix</Table.Th>
+          <Table.Th style={{ width: 92 }}>Rules</Table.Th>
+          <Table.Th style={{ width: 92 }}>Grammar</Table.Th>
+          <Table.Th style={{ width: 92 }}>AI Review</Table.Th>
+          <Table.Th style={{ width: 72 }}>Issues</Table.Th>
+          <Table.Th style={{ width: 130 }}>Status</Table.Th>
+          <Table.Th style={{ width: 80 }} />
+        </Table.Tr>
+      </Table.Thead>
+      <Table.Tbody>
+        {chunks.map((c: SubtitleChunk) => (
+          <Table.Tr key={c.id}>
+            <Table.Td c="dimmed">{c.chunk_index + 1}</Table.Td>
+            <Table.Td c="dimmed">{c.translate_from_line}–{c.translate_to_line}</Table.Td>
+            <Table.Td c="dimmed" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {c.model ?? '—'}
+            </Table.Td>
+            <Table.Td>
+              <PipelineStatus badge={translateBadge(c)} />
+            </Table.Td>
+            <Table.Td>
+              <PipelineStatus badge={validateBadge(c)} />
+            </Table.Td>
+            <Table.Td>
+              <PipelineStatus badge={fixBadge(c)} />
+            </Table.Td>
+            <Table.Td>
+              <PipelineStatus badge={rulesBadge(c)} />
+            </Table.Td>
+            <Table.Td>
+              <PipelineStatus badge={grammarBadge(c)} />
+            </Table.Td>
+            <Table.Td>
+              <PipelineStatus badge={aiReviewBadge(c)} />
+            </Table.Td>
+            <Table.Td>
+              <IssuesCell chunk={c} />
+            </Table.Td>
+            <Table.Td>
+              <ChunkStatusBadge chunk={c} />
+            </Table.Td>
+            <Table.Td style={{textAlign: 'right', minHeight: '45px', height: '45px'}}>
+              <ChunkRetryButton chunk={c} projectId={projectId} fileId={fileId} />
+            </Table.Td>
+          </Table.Tr>
+        ))}
+      </Table.Tbody>
+      </Table>
+    </ScrollArea>
+  );
+}
+
+// ─── File row ─────────────────────────────────────────────────────────────────
+
+function FileRow({
+  file,
+  projectId,
+  onEditSubtitles,
+}: {
+  file: VideoFile;
+  projectId: number;
+  onEditSubtitles: (file: VideoFile) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const showEditButton = file.status === 'processing' || file.status === 'review_required';
+
+  return (
+    <>
+      <Table.Tr style={{ cursor: 'pointer' }} onClick={() => setExpanded((v) => !v)}>
+        <Table.Td>
+          <Text size="sm" truncate>{file.filename}</Text>
+        </Table.Td>
+        <Table.Td>
+          {file.status === 'processing' && file.chunks_total != null ? (
+            <Text size="xs" c="dimmed">{file.chunks_done ?? 0}/{file.chunks_total}</Text>
+          ) : file.last_error_code ? (
+            <Text size="xs" c="red" truncate title={file.last_error_message ?? undefined}>
+              {file.last_error_code}
+            </Text>
+          ) : null}
+        </Table.Td>
+        <Table.Td>
+          <Badge color={FILE_STATUS_COLORS[file.status]} variant="light" size="sm">
+            {file.status.replace(/_/g, ' ')}
+          </Badge>
+        </Table.Td>
+        <Table.Td>
+          <Text size="xs" c="dimmed">{file.detected_subtitle_format ?? '—'}</Text>
+        </Table.Td>
+        <Table.Td>
+          <Text size="xs" c="dimmed">{new Date(file.updated_at).toLocaleString()}</Text>
+        </Table.Td>
+        <Table.Td>
+          <FileIssuesCell file={file} />
+        </Table.Td>
+        <Table.Td style={{ width: 112, textAlign: 'right', minHeight: '45px', height: '45px' }}>
+          {showEditButton && (
+          <Button
+            size="xs"
+            variant="outline"
+            color="pink"
+            leftSection={<NotePencil size={13} />}
+            onClick={(e) => {
+              e.stopPropagation();
+              onEditSubtitles(file);
+            }}
+          >
+            {file.status === 'review_required' ? 'Review' : 'Edit subtitles'}
+          </Button>
+          )}
+        </Table.Td>
+        <Table.Td style={{ width: 28, textAlign: 'center' }}>
+          <ActionIcon size="xs" variant="subtle" color="gray" onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}>
+            {expanded ? <CaretDown size={12} /> : <CaretRight size={12} />}
+          </ActionIcon>
+        </Table.Td>
+      </Table.Tr>
+      {expanded && (
+        <Table.Tr>
+          <Table.Td colSpan={8} style={{ backgroundColor: 'var(--mantine-color-dark-7)', padding: '10px 16px' }}>
+            <FileChunksPanel projectId={projectId} fileId={file.id} />
+          </Table.Td>
+        </Table.Tr>
+      )}
+    </>
+  );
+}
+
+// ─── Components ───────────────────────────────────────────────────────────────
+
+function ProjectCard({
+  project,
+  selected,
+  onClick,
+}: {
+  project: Project;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  const theme = useMantineTheme();
+
+  return (
+    <UnstyledButton onClick={onClick} w="100%">
+      <Card
+        p="sm"
+        radius="md"
+        withBorder
+        style={{
+          borderColor: selected ? theme.colors.pink[6] : undefined,
+          backgroundColor: selected ? 'var(--mantine-color-dark-5)' : undefined,
+          cursor: 'pointer',
+        }}
+      >
+        <Group justify="space-between" gap="xs">
+          <Text size="sm" fw={600} truncate style={{ flex: 1 }}>
+            {project.name}
+          </Text>
+          <Box
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: '50%',
+              backgroundColor: getProjectDotColor(project),
+              flexShrink: 0,
+            }}
+          />
+        </Group>
+      </Card>
+    </UnstyledButton>
+  );
+}
+
+function ProjectSidebar({
+  projects,
+  selectedId,
+  onSelect,
+  onImport,
+}: {
+  projects: Project[];
+  selectedId: number | null;
+  onSelect: (id: number) => void;
+  onImport: () => void;
+}) {
+  return (
+    <Stack gap="xs" h="100%">
+      <Button leftSection={<Plus size={16} weight="bold" />} fullWidth onClick={onImport}>
+        Import
+      </Button>
+
+      <ScrollArea style={{ flex: 1 }}>
+        <Stack gap="xs" w="100%">
+          {projects.map((p) => (
+            <ProjectCard
+              key={p.id}
+              project={p}
+              selected={p.id === selectedId}
+              onClick={() => onSelect(p.id)}
+            />
+          ))}
+        </Stack>
+      </ScrollArea>
+
+      <ActiveJobsPanel />
+    </Stack>
+  );
+}
+
+function EmptyProjectLanding({ isLoading }: { isLoading: boolean }) {
+  if (isLoading) {
+    return (
+      <Center h="100%">
+        <Text c="dimmed">Loading…</Text>
+      </Center>
+    );
+  }
+
+  return (
+    <Box
+      h="100%"
+      style={{
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'flex-start',
+        paddingTop: 56,
+      }}
+    >
+      <Stack gap="lg" align="center" maw={760} w="100%">
+        <Stack gap={8} align="center" ta="center" px="md">
+          <Title
+            order={1}
+            c="pink.2"
+            style={{
+              fontSize: 28,
+              lineHeight: 1.18,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            Nyaa… you haven’t brought me anything to work on yet.
+          </Title>
+          <Text size="lg" c="dimmed" fw={500}>
+            Import a project. I’ll take it from here.
+          </Text>
+        </Stack>
+
+        <Image
+          src={posterUrl}
+          alt="Subi neko"
+		  h={200}
+		  w="auto"
+        />
+      </Stack>
+    </Box>
+  );
+}
+
+function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: () => void }) {
+  const { data: files = [], isLoading } = useProjectFiles(project.id);
+  const deleteMutation = useDeleteProject();
+  const pauseMutation = usePauseProject();
+  const resumeMutation = useResumeProject();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [mappingOpen, setMappingOpen] = useState(false);
+  const [subtitleEditorFile, setSubtitleEditorFile] = useState<VideoFile | null>(null);
+
+  const isTerminal = project.status === 'completed' || project.status === 'failed';
+
+  async function handleDelete() {
+    await deleteMutation.mutateAsync(project.id);
+    setConfirmOpen(false);
+    onDeleted();
+  }
+
+  async function handlePauseResume() {
+    if (project.is_paused) {
+      await resumeMutation.mutateAsync(project.id);
+    } else {
+      await pauseMutation.mutateAsync(project.id);
+    }
+  }
+
+  return (
+    <>
+      <Modal
+        opened={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        title="Remove project"
+        size="sm"
+      >
+        <Text size="sm" mb="lg">
+          Remove <strong>{project.name}</strong>? All project data (files, jobs, characters) will be
+          deleted from the database. Files on disk will not be touched.
+        </Text>
+        <Group justify="flex-end" gap="sm">
+          <Button variant="default" onClick={() => setConfirmOpen(false)}>
+            Cancel
+          </Button>
+          <Button color="red" loading={deleteMutation.isPending} onClick={handleDelete}>
+            Remove
+          </Button>
+        </Group>
+      </Modal>
+
+      <CharacterMappingDialog
+        projectId={project.id}
+        opened={mappingOpen}
+        onClose={() => setMappingOpen(false)}
+      />
+
+      <SubtitleEditorDialog
+        projectId={project.id}
+        file={subtitleEditorFile}
+        opened={subtitleEditorFile !== null}
+        onClose={() => setSubtitleEditorFile(null)}
+      />
+
+      <Stack gap="lg">
+        {/* Project header */}
+        <Box>
+          <Group justify="space-between" align="flex-start">
+            <Box>
+              <Title order={3}>{project.name}</Title>
+              <Group gap="sm" mt={4}>
+                <Badge
+                  color={PROJECT_STATUS_COLORS[project.status] ?? 'gray'}
+                  variant="light"
+                  size="sm"
+                >
+                  {project.status.replace(/_/g, ' ')}
+                </Badge>
+                {project.is_paused && (
+                  <Badge variant="outline" color="yellow" size="sm">paused</Badge>
+                )}
+                <Text size="xs" c="dimmed">
+                  {project.source_directory}
+                </Text>
+              </Group>
+            </Box>
+            <Group gap="xs">
+              {!isTerminal && (
+                <Button
+                  variant="subtle"
+                  color={project.is_paused ? 'green' : 'yellow'}
+                  size="xs"
+                  leftSection={project.is_paused ? <Play size={14} /> : <Pause size={14} />}
+                  loading={pauseMutation.isPending || resumeMutation.isPending}
+                  onClick={handlePauseResume}
+                >
+                  {project.is_paused ? 'Resume' : 'Pause'}
+                </Button>
+              )}
+              <Button
+                variant="subtle"
+                color="red"
+                size="xs"
+                leftSection={<Trash size={14} />}
+                onClick={() => setConfirmOpen(true)}
+              >
+                Remove
+              </Button>
+            </Group>
+          </Group>
+        </Box>
+
+      {/* Pipeline */}
+      <ProjectPipeline project={project} files={files} onMapCharacters={() => setMappingOpen(true)} />
+
+      {/* File list */}
+      <Box>
+        {isLoading ? (
+          <Center py="md"><Loader size="sm" /></Center>
+        ) : files.length === 0 ? (
+          <Text size="sm" c="dimmed">No files discovered yet.</Text>
+        ) : (
+          <Table striped highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Filename</Table.Th>
+                <Table.Th style={{ width: 140 }}>Chunks</Table.Th>
+                <Table.Th style={{ width: 150 }}>Status</Table.Th>
+                <Table.Th style={{ width: 100 }}>Format</Table.Th>
+                <Table.Th style={{ width: 160 }}>Updated</Table.Th>
+                <Table.Th style={{ width: 80 }}>Issues</Table.Th>
+                <Table.Th style={{ width: 112 }} />
+                <Table.Th style={{ width: 28 }} />
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {files.map((f) => (
+                <FileRow key={f.id} file={f} projectId={project.id} onEditSubtitles={setSubtitleEditorFile} />
+              ))}
+            </Table.Tbody>
+          </Table>
+        )}
+      </Box>
+    </Stack>
+    </>
+  );
+}
+
+// ─── Main layout ──────────────────────────────────────────────────────────────
+
+export function AppLayout() {
+  const { data: projects = [], isLoading } = useProjects();
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+
+  const effectiveId = selectedProjectId ?? projects[0]?.id ?? null;
+  const selectedProject = projects.find((p) => p.id === effectiveId) ?? null;
+
+  return (
+    <>
+      <OptionsDrawer opened={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <ImportDialog opened={importOpen} onClose={() => setImportOpen(false)} />
+      <AppShell
+        header={{ height: 52 }}
+        navbar={{ width: 260, breakpoint: 'sm' }}
+        padding="md"
+      >
+        {/* Header */}
+        <AppShell.Header
+          bg="pink"
+          style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: 'none' }}
+          px="md"
+        >
+          <Group gap="sm">
+            <Image src="/logo.png" alt="Subi neko" h={30} w="auto" />
+            <Title order={4} c="white" style={{ letterSpacing: '-0.3px' }}>
+              Subi neko
+            </Title>
+          </Group>
+          <ActionIcon variant="subtle" color="white" size="lg" aria-label="Settings" onClick={() => setSettingsOpen(true)}>
+            <Gear size={22} />
+          </ActionIcon>
+        </AppShell.Header>
+
+        {/* Sidebar */}
+        <AppShell.Navbar p="sm">
+          {isLoading ? (
+            <Center h="100%"><Loader size="sm" /></Center>
+          ) : (
+            <ProjectSidebar
+              projects={projects}
+              selectedId={effectiveId}
+              onSelect={setSelectedProjectId}
+              onImport={() => setImportOpen(true)}
+            />
+          )}
+        </AppShell.Navbar>
+
+        {/* Main content */}
+        <AppShell.Main>
+          {selectedProject ? (
+            <ProjectDetails
+              project={selectedProject}
+              onDeleted={() => setSelectedProjectId(null)}
+            />
+          ) : (
+            <EmptyProjectLanding isLoading={isLoading} />
+          )}
+        </AppShell.Main>
+      </AppShell>
+    </>
+  );
+}
+

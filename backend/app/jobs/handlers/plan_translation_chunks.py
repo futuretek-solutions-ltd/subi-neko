@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from math import ceil
 from datetime import datetime
 from typing import Any
 
@@ -12,6 +13,21 @@ from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.registry import register_job_handler
 
 logger = logging.getLogger(__name__)
+
+
+def _effective_chunk_size(total_lines: int, configured_chunk_size: int) -> int:
+    if configured_chunk_size <= 0:
+        return configured_chunk_size
+
+    chunk_count = ceil(total_lines / configured_chunk_size)
+    remainder = total_lines % configured_chunk_size
+    if chunk_count <= 1 or remainder == 0:
+        return configured_chunk_size
+
+    if remainder * 10 >= configured_chunk_size:
+        return configured_chunk_size
+
+    return ceil(total_lines / (chunk_count - 1))
 
 
 @register_job_handler("plan_translation_chunks")
@@ -52,6 +68,7 @@ def plan_translation_chunks(
     # Group into contiguous chunks of chunk_size
     chunk_rows: list[dict] = []
     total = len(dialogue_lines)
+    chunk_size = _effective_chunk_size(total, chunk_size)
 
     for chunk_index, start_pos in enumerate(range(0, total, chunk_size)):
         chunk_lines = dialogue_lines[start_pos: start_pos + chunk_size]

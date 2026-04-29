@@ -36,6 +36,13 @@ interface CharacterDraft {
 
 type DraftMap = Record<number, CharacterDraft>;
 
+const GENDER_OPTIONS = [
+  { value: 'male', label: 'Male' },
+  { value: 'female', label: 'Female' },
+  { value: 'non_binary', label: 'Non-binary' },
+  { value: 'other', label: 'Other' },
+];
+
 const ROLE_ORDER: Record<string, number> = { MAIN: 0, SUPPORTING: 1, NARRATOR: 2 };
 const ROLE_COLORS: Record<string, string> = {
   MAIN: 'pink', SUPPORTING: 'blue', NARRATOR: 'violet', BACKGROUND: 'gray',
@@ -103,12 +110,7 @@ function CharacterRow({ character, draft, speakerOptions, onChange }: CharacterR
         placeholder="Gender"
         style={{ width: 110, flexShrink: 0 }}
         clearable
-        data={[
-          { value: 'male', label: 'Male' },
-          { value: 'female', label: 'Female' },
-          { value: 'other', label: 'Other' },
-          { value: 'unknown', label: 'Unknown' },
-        ]}
+        data={GENDER_OPTIONS}
         value={draft.gender}
         onChange={(v) => onChange(character.id, { gender: v })}
       />

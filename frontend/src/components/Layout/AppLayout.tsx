@@ -448,18 +448,23 @@ function FileChunksPanel({ projectId, fileId }: { projectId: number; fileId: num
 function FileRow({
   file,
   projectId,
+  expanded,
   onEditSubtitles,
+  onToggleExpanded,
 }: {
   file: VideoFile;
   projectId: number;
+  expanded: boolean;
   onEditSubtitles: (file: VideoFile) => void;
+  onToggleExpanded: (fileId: number) => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const showEditButton = file.status === 'processing' || file.status === 'review_required';
+  const showEditButton = file.status === 'processing'
+      || (file.status === 'waiting' && (file.blocking_reason === 'validation_failed' || file.blocking_reason === 'translation_failed' ))
+      || file.status === 'review_required';
 
   return (
     <>
-      <Table.Tr style={{ cursor: 'pointer' }} onClick={() => setExpanded((v) => !v)}>
+      <Table.Tr style={{ cursor: 'pointer' }} onClick={() => onToggleExpanded(file.id)}>
         <Table.Td>
           <Text size="sm" truncate>{file.filename}</Text>
         </Table.Td>
@@ -503,7 +508,7 @@ function FileRow({
           )}
         </Table.Td>
         <Table.Td style={{ width: 28, textAlign: 'center' }}>
-          <ActionIcon size="xs" variant="subtle" color="gray" onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}>
+          <ActionIcon size="xs" variant="subtle" color="gray" onClick={(e) => { e.stopPropagation(); onToggleExpanded(file.id); }}>
             {expanded ? <CaretDown size={12} /> : <CaretRight size={12} />}
           </ActionIcon>
         </Table.Td>
@@ -654,8 +659,28 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [mappingOpen, setMappingOpen] = useState(false);
   const [subtitleEditorFile, setSubtitleEditorFile] = useState<VideoFile | null>(null);
+  const [expandedFileIds, setExpandedFileIds] = useState<Set<number>>(() => new Set());
 
   const isTerminal = project.status === 'completed' || project.status === 'failed';
+  const allFilesExpanded = files.length > 0 && files.every((file) => expandedFileIds.has(file.id));
+
+  function handleToggleFileExpanded(fileId: number) {
+    setExpandedFileIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(fileId)) {
+        next.delete(fileId);
+      } else {
+        next.add(fileId);
+      }
+      return next;
+    });
+  }
+
+  function handleToggleAllFilesExpanded() {
+    setExpandedFileIds(() => (
+      allFilesExpanded ? new Set() : new Set(files.map((file) => file.id))
+    ));
+  }
 
   async function handleDelete() {
     await deleteMutation.mutateAsync(project.id);
@@ -774,12 +799,30 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
                 <Table.Th style={{ width: 160 }}>Updated</Table.Th>
                 <Table.Th style={{ width: 80 }}>Issues</Table.Th>
                 <Table.Th style={{ width: 112 }} />
-                <Table.Th style={{ width: 28 }} />
+                <Table.Th style={{ width: 28, textAlign: 'center' }}>
+                  <ActionIcon
+                    size="xs"
+                    variant="subtle"
+                    color="gray"
+                    title={allFilesExpanded ? 'Collapse all chunk info' : 'Expand all chunk info'}
+                    aria-label={allFilesExpanded ? 'Collapse all chunk info' : 'Expand all chunk info'}
+                    onClick={handleToggleAllFilesExpanded}
+                  >
+                    {allFilesExpanded ? <CaretDown size={12} /> : <CaretRight size={12} />}
+                  </ActionIcon>
+                </Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
               {files.map((f) => (
-                <FileRow key={f.id} file={f} projectId={project.id} onEditSubtitles={setSubtitleEditorFile} />
+                <FileRow
+                  key={f.id}
+                  file={f}
+                  projectId={project.id}
+                  expanded={expandedFileIds.has(f.id)}
+                  onEditSubtitles={setSubtitleEditorFile}
+                  onToggleExpanded={handleToggleFileExpanded}
+                />
               ))}
             </Table.Tbody>
           </Table>

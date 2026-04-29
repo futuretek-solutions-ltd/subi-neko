@@ -22,7 +22,6 @@ _CORRUPTION_PREFIXES = re.compile(
 )
 _MARKDOWN_FENCE = re.compile(r"```")
 _JSON_LIKE = re.compile(r"^\s*[\[{]")
-_NUMBERING = re.compile(r"^\s*(\d+[\.\)]\s+|[-*•]\s+)")
 _BROKEN_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _LEADING_ASS_OVERRIDE_BLOCKS = re.compile(r"^\s*(?:\{\\[^}]*\}\s*)+")
 
@@ -129,8 +128,6 @@ def _check_text_corruption(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
         reasons.append("markdown_fence")
     if _JSON_LIKE.match(text_for_prefix_checks):
         reasons.append("json_like_output")
-    if _NUMBERING.match(text_for_prefix_checks):
-        reasons.append("numbering_or_bullet")
     if _BROKEN_CONTROL.search(text):
         reasons.append("broken_control_characters")
 

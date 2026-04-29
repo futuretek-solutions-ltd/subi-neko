@@ -21,7 +21,6 @@ _CORRUPTION_PREFIXES = re.compile(
     re.IGNORECASE,
 )
 _MARKDOWN_FENCE = re.compile(r"```")
-_JSON_LIKE = re.compile(r"^\s*[\[{]")
 _BROKEN_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _LEADING_ASS_OVERRIDE_BLOCKS = re.compile(r"^\s*(?:\{\\[^}]*\}\s*)+")
 
@@ -37,41 +36,49 @@ def _check_missing_translation(event: SubtitleEvent) -> list[tuple[str, str, dic
     return []
 
 
-def _count_ass_tag_blocks(text: str) -> tuple[int, int]:
-    """Return (open_brace_count, close_brace_count)."""
-    return text.count("{"), text.count("}")
+def _ass_override_blocks(text: str) -> tuple[list[str], bool]:
+    """Return ASS override blocks and whether an override block is unclosed.
 
-
-def _has_unclosed_block(text: str) -> bool:
-    depth = 0
-    for ch in text:
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth < 0:
-                return True
-    return depth != 0
+    ASS override tags are blocks starting with "{\\". Other braces can appear
+    in source event text from real-world files, so validation only treats ASS
+    override spans as formatting that must be preserved.
+    """
+    blocks: list[str] = []
+    malformed = False
+    pos = 0
+    while pos < len(text):
+        start = text.find("{\\", pos)
+        if start < 0:
+            break
+        end = text.find("}", start + 2)
+        if end < 0:
+            malformed = True
+            break
+        blocks.append(text[start:end + 1])
+        pos = end + 1
+    return blocks, malformed
 
 
 def _check_formatting_tag_mismatch(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
     src = event.source_text or ""
     tgt = event.translated_text or ""
 
-    src_open, src_close = _count_ass_tag_blocks(src)
-    tgt_open, tgt_close = _count_ass_tag_blocks(tgt)
+    src_blocks, src_malformed = _ass_override_blocks(src)
+    tgt_blocks, tgt_malformed = _ass_override_blocks(tgt)
 
     details: dict[str, Any] = {}
     failed = False
 
-    if src_open != tgt_open or src_close != tgt_close:
-        details["source_open"] = src_open
-        details["source_close"] = src_close
-        details["translated_open"] = tgt_open
-        details["translated_close"] = tgt_close
+    if src_blocks != tgt_blocks:
+        details["source_blocks"] = src_blocks
+        details["translated_blocks"] = tgt_blocks
         failed = True
 
-    if _has_unclosed_block(tgt):
+    if src_malformed or tgt_malformed:
+        if src_malformed:
+            details["source_unclosed_override_block"] = True
+        if tgt_malformed:
+            details["translated_unclosed_override_block"] = True
         details["unclosed_block"] = True
         failed = True
 
@@ -126,7 +133,7 @@ def _check_text_corruption(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
         reasons.append("assistant_prefix")
     if _MARKDOWN_FENCE.search(text):
         reasons.append("markdown_fence")
-    if _JSON_LIKE.match(text_for_prefix_checks):
+    if _is_json_output(text_for_prefix_checks):
         reasons.append("json_like_output")
     if _BROKEN_CONTROL.search(text):
         reasons.append("broken_control_characters")
@@ -136,6 +143,17 @@ def _check_text_corruption(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
                  "Translated text appears corrupted or contains non-subtitle output.",
                  {"reasons": reasons})]
     return []
+
+
+def _is_json_output(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "[{":
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, (dict, list))
 
 
 _CHECKS = [

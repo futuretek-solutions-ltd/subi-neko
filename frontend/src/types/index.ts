@@ -123,6 +123,9 @@ export interface SubtitleEventEditorRow {
   source_text: string;
   translated_text: string | null;
   original_ai_translated_text: string | null;
+  speaker_name: string | null;
+  character_name: string | null;
+  character_gender: string | null;
   is_user_edited: boolean;
   is_locked: boolean;
   is_approved: boolean;

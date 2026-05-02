@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActionIcon,
   Badge,
@@ -111,12 +111,12 @@ function IssueRow({
   );
 }
 
-function SubtitleRow({
+const SubtitleRow = memo(function SubtitleRow({
   row,
   draft,
   resolvingIssueId,
-  savingEventId,
-  revertingEventId,
+  saving,
+  reverting,
   onChange,
   onBlurSave,
   onRevert,
@@ -125,8 +125,8 @@ function SubtitleRow({
   row: SubtitleEventEditorRow;
   draft: SubtitleDraft;
   resolvingIssueId: number | null;
-  savingEventId: number | null;
-  revertingEventId: number | null;
+  saving: boolean;
+  reverting: boolean;
   onChange: (eventId: number, translatedText: string) => void;
   onBlurSave: (row: SubtitleEventEditorRow) => void;
   onRevert: (row: SubtitleEventEditorRow) => void;
@@ -147,6 +147,25 @@ function SubtitleRow({
             </Tooltip>
           )}
         </Group>
+        {row.speaker_name && (
+          <Stack gap={2} mt={8}>
+            <Text size="xs" c="dimmed" truncate title={row.speaker_name}>
+              {row.speaker_name}
+            </Text>
+            {row.character_name && (
+              <Group gap={4} wrap="nowrap">
+                <Badge size="xs" variant="light" color="blue" style={{ maxWidth: 82 }}>
+                  <Text size="xs" truncate>{row.character_name}</Text>
+                </Badge>
+                {row.character_gender && (
+                  <Badge size="xs" variant="outline" color="gray">
+                    {row.character_gender}
+                  </Badge>
+                )}
+              </Group>
+            )}
+          </Stack>
+        )}
       </Table.Td>
       <Table.Td style={{ width: '30%', verticalAlign: 'top' }}>
         <Textarea
@@ -167,7 +186,7 @@ function SubtitleRow({
             value={draft.translated_text}
             onChange={(e) => onChange(row.id, e.currentTarget.value)}
             onBlur={() => onBlurSave(row)}
-            disabled={savingEventId === row.id || revertingEventId === row.id}
+            disabled={saving || reverting}
             styles={{ root: { flex: 1 }, input: { fontSize: 13, lineHeight: 1.35 } }}
           />
           <Tooltip label="Revert to AI translation" withArrow>
@@ -176,8 +195,8 @@ function SubtitleRow({
               variant="subtle"
               color="gray"
               aria-label="Revert to AI translation"
-              disabled={!canRevert || savingEventId === row.id || revertingEventId === row.id}
-              loading={revertingEventId === row.id}
+              disabled={!canRevert || saving || reverting}
+              loading={reverting}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => onRevert(row)}
             >
@@ -185,7 +204,7 @@ function SubtitleRow({
             </ActionIcon>
           </Tooltip>
         </Group>
-        {savingEventId === row.id && <Text size="xs" c="dimmed" mt={4}>Saving…</Text>}
+        {saving && <Text size="xs" c="dimmed" mt={4}>Saving…</Text>}
       </Table.Td>
       <Table.Td style={{ verticalAlign: 'top' }}>
         {issues.length === 0 ? (
@@ -205,7 +224,13 @@ function SubtitleRow({
       </Table.Td>
     </Table.Tr>
   );
-}
+}, (prev, next) => (
+  prev.row === next.row
+  && prev.draft === next.draft
+  && prev.saving === next.saving
+  && prev.reverting === next.reverting
+  && !prev.row.issues.some((issue) => issue.id === prev.resolvingIssueId || issue.id === next.resolvingIssueId)
+));
 
 interface SubtitleEditorDialogProps {
   projectId: number;
@@ -246,14 +271,34 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
     () => Object.values(drafts).filter((draft) => draft.dirty).length,
     [drafts],
   );
-  const issueCount = rows.reduce((sum, row) => sum + row.issues.length, 0);
+  const issueSummary = useMemo(() => {
+    const counts = new Map<string, { qa_type: string; severity: string; count: number }>();
+    for (const row of rows) {
+      for (const issue of row.issues) {
+        const key = `${issue.severity}:${issue.qa_type}`;
+        const existing = counts.get(key);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          counts.set(key, { qa_type: issue.qa_type, severity: issue.severity, count: 1 });
+        }
+      }
+    }
+    return [...counts.values()].sort((a, b) => {
+      const ar = SEVERITY_RANK[a.severity.toLowerCase()] ?? 99;
+      const br = SEVERITY_RANK[b.severity.toLowerCase()] ?? 99;
+      if (ar !== br) return ar - br;
+      return b.count - a.count;
+    });
+  }, [rows]);
+  const issueCount = issueSummary.reduce((sum, item) => sum + item.count, 0);
   const visibleRows = useMemo(
     () => (issuesOnly ? rows.filter((row) => row.issues.length > 0) : rows),
     [issuesOnly, rows],
   );
   const isBusy = updateSubtitleEvent.isPending || revertSubtitleEvent.isPending || resolveQaIssue.isPending;
 
-  function handleDraftChange(eventId: number, translatedText: string) {
+  const handleDraftChange = useCallback((eventId: number, translatedText: string) => {
     setDrafts((prev) => ({
       ...prev,
       [eventId]: {
@@ -262,9 +307,9 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
         dirty: true,
       },
     }));
-  }
+  }, []);
 
-  async function handleBlurSave(row: SubtitleEventEditorRow) {
+  const handleBlurSave = useCallback(async (row: SubtitleEventEditorRow) => {
     if (!file) return;
     const draft = drafts[row.id];
     if (!draft || !draft.dirty) return;
@@ -300,9 +345,9 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
     } finally {
       setSavingEventId(null);
     }
-  }
+  }, [drafts, file, projectId, updateSubtitleEvent]);
 
-  async function handleRevert(row: SubtitleEventEditorRow) {
+  const handleRevert = useCallback(async (row: SubtitleEventEditorRow) => {
     if (!file) return;
     setRevertingEventId(row.id);
     try {
@@ -319,9 +364,9 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
     } finally {
       setRevertingEventId(null);
     }
-  }
+  }, [file, projectId, revertSubtitleEvent]);
 
-  async function handleResolve(issueId: number) {
+  const handleResolve = useCallback(async (issueId: number) => {
     if (!file) return;
     setResolvingIssueId(issueId);
     try {
@@ -331,7 +376,7 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
     } finally {
       setResolvingIssueId(null);
     }
-  }
+  }, [file, projectId, resolveQaIssue]);
 
   function handleClose() {
     setDrafts({});
@@ -371,9 +416,27 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
       ) : (
         <Stack gap="sm">
           <Group justify="space-between" gap="sm">
-            <Text size="xs" c="dimmed">
-              Showing {visibleRows.length} of {rows.length} events
-            </Text>
+            <Group gap="xs" wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+              <Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+                Showing {visibleRows.length} of {rows.length} events
+              </Text>
+              {issueSummary.length > 0 && (
+                <Group gap={4} wrap="nowrap" style={{ minWidth: 0, overflow: 'hidden' }}>
+                  {issueSummary.map((item) => (
+                    <Badge
+                      key={`${item.severity}:${item.qa_type}`}
+                      size="xs"
+                      color={SEVERITY_COLORS[item.severity.toLowerCase()] ?? 'gray'}
+                      variant="light"
+                      title={`${item.count} ${item.qa_type.replace(/_/g, ' ')}`}
+                      style={{ flexShrink: 0 }}
+                    >
+                      {item.qa_type.replace(/_/g, ' ')}: {item.count}
+                    </Badge>
+                  ))}
+                </Group>
+              )}
+            </Group>
             <Checkbox
               size="xs"
               checked={issuesOnly}
@@ -405,8 +468,8 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
                         row={row}
                         draft={drafts[row.id]}
                         resolvingIssueId={resolvingIssueId}
-                        savingEventId={savingEventId}
-                        revertingEventId={revertingEventId}
+                        saving={savingEventId === row.id}
+                        reverting={revertingEventId === row.id}
                         onChange={handleDraftChange}
                         onBlurSave={handleBlurSave}
                         onRevert={handleRevert}

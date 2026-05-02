@@ -27,6 +27,7 @@ import {
   CheckCircle,
   Clock,
   Gear,
+  Info,
   MinusCircle,
   NotePencil,
   Pause,
@@ -39,7 +40,7 @@ import {
   XCircle,
 } from '@phosphor-icons/react';
 import type { ChunkJob, FileStatus, Project, SubtitleChunk, VideoFile } from '../../types';
-import { useProjects, useProjectFiles, useFileChunks, useDeleteProject, usePauseProject, useResumeProject, useRetryChunk } from '../../hooks/useProjects';
+import { useProjects, useProjectFiles, useFileChunks, useDeleteProject, usePauseProject, useResumeProject, useRetryChunk, useAcceptFileReview } from '../../hooks/useProjects';
 import { OptionsDrawer } from '../../pages/OptionsDrawer';
 import { ImportDialog } from '../../pages/ImportDialog';
 import { CharacterMappingDialog } from '../../pages/CharacterMappingDialog';
@@ -82,6 +83,17 @@ const PROJECT_STATUS_COLORS: Record<string, string> = {
   completed: 'green',
   failed: 'red',
 };
+
+function directoryName(path: string): string {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalized.split('/').pop() || path;
+}
+
+function seriesUrl(project: Project): string | null {
+  if (project.anime_provider === 'anilist') return `https://anilist.co/anime/${project.anime_external_id}`;
+  if (project.anime_provider === 'anidb') return `https://anidb.net/anime/${project.anime_external_id}`;
+  return null;
+}
 
 // ─── Chunk panel ──────────────────────────────────────────────────────────────
 
@@ -180,7 +192,15 @@ function translateBadge(chunk: SubtitleChunk): PipelineBadge {
 
 function validateBadge(chunk: SubtitleChunk): PipelineBadge {
   const job = chunkJob(chunk, 'validate_chunk');
-  if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'validate_chunk', job };
+  if (job?.status === 'failed') {
+    if (job.result?.valid === true && COMPLETE_AFTER_VALIDATE.has(chunk.status)) {
+      return { label: labelWithRuns('Done', job), tone: 'done', jobType: 'validate_chunk', job };
+    }
+    if (job.result?.valid === false) {
+      return { label: labelWithRuns('Rejected', job), tone: 'issues', jobType: 'validate_chunk', job };
+    }
+    return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'validate_chunk', job };
+  }
   if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'validate_chunk', job };
   if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'validate_chunk', job };
   if (isCompleted(job)) {
@@ -208,10 +228,10 @@ function rulesBadge(chunk: SubtitleChunk): PipelineBadge {
   if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'review_chunk_rules', job };
   if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'review_chunk_rules', job };
   if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'review_chunk_rules', job };
+  if (!COMPLETE_AFTER_VALIDATE.has(chunk.status)) return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_rules', job };
   if (isCompleted(job)) return warnings > 0
     ? { label: `Issues (${warnings})`, tone: 'issues', jobType: 'review_chunk_rules', job }
     : { label: labelWithRuns('Done', job), tone: 'done', jobType: 'review_chunk_rules', job };
-  if (!COMPLETE_AFTER_VALIDATE.has(chunk.status)) return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_rules', job };
   if (COMPLETE_AFTER_RULES.has(chunk.status)) return { label: 'Done', tone: 'done', jobType: 'review_chunk_rules', job };
   return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_rules', job };
 }
@@ -222,6 +242,7 @@ function grammarBadge(chunk: SubtitleChunk): PipelineBadge {
   if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'review_chunk_grammar', job };
   if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'review_chunk_grammar', job };
   if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'review_chunk_grammar', job };
+  if (!COMPLETE_AFTER_RULES.has(chunk.status)) return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_grammar', job };
   if (isCompleted(job)) {
     return warnings > 0
       ? { label: `Issues (${warnings})`, tone: 'issues', jobType: 'review_chunk_grammar', job }
@@ -236,6 +257,9 @@ function aiReviewBadge(chunk: SubtitleChunk): PipelineBadge {
   if (job?.status === 'failed') return { label: labelWithRuns('Failed', job), tone: 'failed', jobType: 'review_chunk_llm', job };
   if (isProcessing(job)) return { label: 'Processing', tone: 'processing', jobType: 'review_chunk_llm', job };
   if (isQueued(job)) return { label: 'Queued', tone: 'queued', jobType: 'review_chunk_llm', job };
+  if (!COMPLETE_AFTER_GRAMMAR.has(chunk.status) && chunk.status !== 'llm_reviewed' && chunk.status !== 'complete') {
+    return { label: 'Waiting', tone: 'waiting', jobType: 'review_chunk_llm', job };
+  }
   if (isCompleted(job) || chunk.status === 'llm_reviewed') return { label: labelWithRuns('Done', job), tone: 'done', jobType: 'review_chunk_llm', job };
   if (!chunk.llm_review_needed && COMPLETE_AFTER_GRAMMAR.has(chunk.status)) {
     return { label: 'Not needed', tone: 'not-needed', jobType: 'review_chunk_llm', job };
@@ -461,6 +485,8 @@ function FileRow({
   const showEditButton = file.status === 'processing'
       || (file.status === 'waiting' && (file.blocking_reason === 'validation_failed' || file.blocking_reason === 'translation_failed' ))
       || file.status === 'review_required';
+  const acceptReview = useAcceptFileReview(projectId);
+  const showAcceptButton = file.status === 'review_required';
 
   return (
     <>
@@ -491,21 +517,40 @@ function FileRow({
         <Table.Td>
           <FileIssuesCell file={file} />
         </Table.Td>
-        <Table.Td style={{ width: 112, textAlign: 'right', minHeight: '45px', height: '45px' }}>
-          {showEditButton && (
-          <Button
-            size="xs"
-            variant="outline"
-            color="pink"
-            leftSection={<NotePencil size={13} />}
-            onClick={(e) => {
-              e.stopPropagation();
-              onEditSubtitles(file);
-            }}
-          >
-            {file.status === 'review_required' ? 'Review' : 'Edit subtitles'}
-          </Button>
-          )}
+        <Table.Td style={{ width: 184, textAlign: 'right', minHeight: '45px', height: '45px' }}>
+          <Group gap={6} justify="flex-end" wrap="nowrap">
+            {showAcceptButton && (
+              <Button
+                size="xs"
+                variant="filled"
+                color="green"
+                leftSection={<CheckCircle size={13} />}
+                loading={acceptReview.isPending}
+                disabled={file.qa_issues > 0}
+                title={file.qa_issues > 0 ? 'Resolve all QA issues before accepting review' : 'Accept review and start muxing'}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  acceptReview.mutate(file.id);
+                }}
+              >
+                Accept
+              </Button>
+            )}
+            {showEditButton && (
+              <Button
+                size="xs"
+                variant="outline"
+                color="pink"
+                leftSection={<NotePencil size={13} />}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onEditSubtitles(file);
+                }}
+              >
+                Edit
+              </Button>
+            )}
+          </Group>
         </Table.Td>
         <Table.Td style={{ width: 28, textAlign: 'center' }}>
           <ActionIcon size="xs" variant="subtle" color="gray" onClick={(e) => { e.stopPropagation(); onToggleExpanded(file.id); }}>
@@ -563,6 +608,9 @@ function ProjectCard({
             }}
           />
         </Group>
+        <Text size="xs" c="dimmed" truncate mt={2}>
+          {directoryName(project.source_directory)}
+        </Text>
       </Card>
     </UnstyledButton>
   );
@@ -663,6 +711,7 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
 
   const isTerminal = project.status === 'completed' || project.status === 'failed';
   const allFilesExpanded = files.length > 0 && files.every((file) => expandedFileIds.has(file.id));
+  const infoUrl = seriesUrl(project);
 
   function handleToggleFileExpanded(fileId: number) {
     setExpandedFileIds((prev) => {
@@ -736,7 +785,24 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
         <Box>
           <Group justify="space-between" align="flex-start">
             <Box>
-              <Title order={3}>{project.name}</Title>
+              <Group gap="xs" align="center">
+                <Title order={3}>{project.name}</Title>
+                {infoUrl && (
+                  <ActionIcon
+                    component="a"
+                    href={infoUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    variant="subtle"
+                    color="gray"
+                    size="sm"
+                    aria-label="Open series page"
+                    title={`Open ${project.anime_provider} series page`}
+                  >
+                    <Info size={16} />
+                  </ActionIcon>
+                )}
+              </Group>
               <Group gap="sm" mt={4}>
                 <Badge
                   color={PROJECT_STATUS_COLORS[project.status] ?? 'gray'}
@@ -798,7 +864,7 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
                 <Table.Th style={{ width: 100 }}>Format</Table.Th>
                 <Table.Th style={{ width: 160 }}>Updated</Table.Th>
                 <Table.Th style={{ width: 80 }}>Issues</Table.Th>
-                <Table.Th style={{ width: 112 }} />
+                <Table.Th style={{ width: 184 }} />
                 <Table.Th style={{ width: 28, textAlign: 'center' }}>
                   <ActionIcon
                     size="xs"

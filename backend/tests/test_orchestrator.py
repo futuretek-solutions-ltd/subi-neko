@@ -55,6 +55,7 @@ async def db_session(monkeypatch):
     monkeypatch.setattr("app.orchestrator.file_orchestrator.AsyncSessionLocal", session_factory)
     monkeypatch.setattr("app.orchestrator.project_orchestrator.AsyncSessionLocal", session_factory)
     monkeypatch.setattr("app.api.routes.projects.AsyncSessionLocal", session_factory)
+    monkeypatch.setattr("app.jobs.manager.AsyncSessionLocal", session_factory)
 
     async with session_factory() as session:
         yield session
@@ -524,7 +525,7 @@ class TestFileOrchestrator:
         assert file.status == "processing"
 
     @pytest.mark.asyncio
-    async def test_processing_all_chunks_complete_no_qa_sets_muxing(self, db_session, enqueue_mock):
+    async def test_processing_all_chunks_complete_no_qa_sets_review(self, db_session, enqueue_mock):
         from app.orchestrator.file_orchestrator import orchestrate_file
 
         project = await _create_project(db_session, status="processing")
@@ -534,7 +535,8 @@ class TestFileOrchestrator:
         await orchestrate_file(file.id, enqueue_mock)
 
         await db_session.refresh(file)
-        assert file.status == "muxing"
+        assert file.status == "review_required"
+        assert file.blocking_reason == "user_review_required"
 
     @pytest.mark.asyncio
     async def test_processing_all_chunks_complete_with_qa_sets_review(self, db_session, enqueue_mock):
@@ -582,6 +584,47 @@ class TestFileOrchestrator:
         assert files[0].qa_errors == 1
         assert files[0].qa_warnings == 1
         assert files[0].qa_issues == 2
+
+    @pytest.mark.asyncio
+    async def test_accept_file_review_with_zero_qa_sets_muxing(self, db_session, enqueue_mock):
+        from app.api.routes.projects import accept_file_review
+        import unittest.mock as mock
+
+        project = await _create_project(db_session, status="review_required")
+        file = await _create_file(
+            db_session,
+            project.id,
+            status="review_required",
+            blocking_reason="user_review_required",
+        )
+
+        with mock.patch("app.api.routes.projects.orchestrate_file") as mock_orchestrate:
+            result = await accept_file_review(project.id, file.id)
+
+        await db_session.refresh(file)
+        assert result.status == "muxing"
+        assert file.status == "muxing"
+        assert file.blocking_reason is None
+        mock_orchestrate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_accept_file_review_rejects_unresolved_qa(self, db_session, enqueue_mock):
+        from app.api.routes.projects import accept_file_review
+        from fastapi import HTTPException
+
+        project = await _create_project(db_session, status="review_required")
+        file = await _create_file(
+            db_session,
+            project.id,
+            status="review_required",
+            blocking_reason="user_review_required",
+        )
+        await _create_qa_item(db_session, file.id, severity="warning", is_resolved=0)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await accept_file_review(project.id, file.id)
+
+        assert exc_info.value.status_code == 409
 
     @pytest.mark.asyncio
     async def test_update_subtitle_event_changes_translation_only(self, db_session, enqueue_mock):
@@ -944,6 +987,77 @@ class TestChunkFailureStatuses:
         # But the grammar job for chunk 0 must have been enqueued
         enqueue_mock.assert_called_once()
         assert enqueue_mock.call_args.kwargs["job_type"] == "review_chunk_grammar"
+
+    @pytest.mark.asyncio
+    async def test_waiting_file_with_completed_chunks_promotes_to_review_required(
+        self, db_session, enqueue_mock
+    ):
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(
+            db_session,
+            project.id,
+            status="waiting",
+            blocking_reason="translation_failed",
+        )
+        await _create_chunk(db_session, file.id, 0, status="complete")
+        await _create_qa_item(db_session, file.id, severity="warning", is_resolved=0)
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "review_required"
+        assert file.blocking_reason == "user_review_required"
+        enqueue_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_chunk_job_failure_does_not_rewind_advanced_chunk(
+        self, db_session, enqueue_mock
+    ):
+        from app.jobs.manager import _mark_chunk_job_failed
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        chunk = await _create_chunk(db_session, file.id, 0, status="rules_reviewed")
+
+        await _mark_chunk_job_failed(
+            file.id,
+            "validate_chunk",
+            {"chunk_index": 0},
+            "MAX_ATTEMPTS_EXCEEDED",
+            "Max attempts exceeded",
+        )
+
+        await db_session.refresh(chunk)
+        assert chunk.status == "rules_reviewed"
+        assert chunk.retry_count == 0
+        assert chunk.failed_job_type is None
+
+    @pytest.mark.asyncio
+    async def test_stale_queue_entry_does_not_reclassify_completed_job(
+        self, db_session, enqueue_mock
+    ):
+        from app.jobs.manager import JobManager
+
+        project = await _create_project(db_session, status="processing")
+        job = await _create_job(
+            db_session,
+            project.id,
+            "validate_chunk",
+            "validate_chunk:stale",
+            status="completed",
+        )
+        job.attempt_count = 1
+        job.max_attempts = 1
+        await db_session.commit()
+
+        manager = JobManager()
+        await manager._run_job(job.id)
+
+        await db_session.refresh(job)
+        assert job.status == "completed"
+        assert job.error_code is None
 
 class TestChunkHandlerBehavior:
     """Tests for validate_chunk and repair_chunk handler state changes."""

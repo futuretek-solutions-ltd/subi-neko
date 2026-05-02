@@ -290,6 +290,12 @@ class JobManager:
             record = await session.get(JobRecord, job_id)
             if record is None or record.status == JobStatus.CANCELLED.value:
                 return
+            if record.status != JobStatus.QUEUED.value:
+                logger.info(
+                    "Skipping stale queue entry for job id=%d type=%s status=%s",
+                    job_id, record.job_type, record.status,
+                )
+                return
             if record.attempt_count >= record.max_attempts:
                 logger.warning(
                     "Job id=%d type=%s exceeded max attempts (%d), failing permanently",
@@ -541,6 +547,15 @@ _CHUNK_JOB_TYPES = {
     "review_chunk_llm",
 }
 
+_FAILED_JOB_ALLOWED_CHUNK_STATUSES = {
+    "translate_chunk": {"pending"},
+    "validate_chunk": {"translated"},
+    "repair_chunk": {"validate_trans_failed"},
+    "review_chunk_rules": {"validated"},
+    "review_chunk_grammar": {"rules_reviewed"},
+    "review_chunk_llm": {"grammar_reviewed", "languagetool_reviewed"},
+}
+
 
 async def _mark_chunk_job_failed(
     file_id: int,
@@ -571,6 +586,14 @@ async def _mark_chunk_job_failed(
                 .where(SubtitleChunk.chunk_index == chunk_index)
             )
             if chunk is None:
+                return
+            allowed_statuses = _FAILED_JOB_ALLOWED_CHUNK_STATUSES.get(job_type)
+            if allowed_statuses is not None and chunk.status not in allowed_statuses:
+                logger.info(
+                    "Ignoring stale failure for chunk file_id=%d index=%d "
+                    "(job_type=%s current_status=%s)",
+                    file_id, chunk_index, job_type, chunk.status,
+                )
                 return
             chunk.status = "job_failed"
             chunk.retry_count = (chunk.retry_count or 0) + 1

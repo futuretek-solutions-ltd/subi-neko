@@ -113,6 +113,12 @@ class QaIssueOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class QaIssueSummaryOut(BaseModel):
+    qa_type: str
+    severity: str
+    count: int
+
+
 class SubtitleEventEditorOut(BaseModel):
     id: int
     file_id: int
@@ -121,6 +127,9 @@ class SubtitleEventEditorOut(BaseModel):
     source_text: str
     translated_text: str | None
     original_ai_translated_text: str | None
+    speaker_name: str | None
+    character_name: str | None
+    character_gender: CharacterGender | None
     is_user_edited: bool
     is_locked: bool
     is_approved: bool
@@ -254,6 +263,41 @@ async def list_project_files(project_id: int):
             out.qa_issues = out.qa_errors + out.qa_warnings
             result.append(out)
         return result
+
+
+@router.post("/{project_id}/files/{file_id}/accept-review", response_model=FileOut)
+async def accept_file_review(project_id: int, file_id: int):
+    now = datetime.utcnow().isoformat()
+    async with AsyncSessionLocal() as session:
+        file = await session.get(File, file_id)
+        if file is None or file.project_id != project_id:
+            raise HTTPException(status_code=404, detail="File not found")
+        if file.status != FileStatus.REVIEW_REQUIRED.value:
+            raise HTTPException(
+                status_code=409,
+                detail=f"File is not in review_required state (current: {file.status})",
+            )
+
+        unresolved_qa_count = await session.scalar(
+            select(func.count())
+            .select_from(QaItem)
+            .where(QaItem.file_id == file_id, QaItem.is_resolved == 0)
+        )
+        if unresolved_qa_count > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot accept review while unresolved QA issues remain",
+            )
+
+        file.status = FileStatus.MUXING.value
+        file.blocking_reason = None
+        file.updated_at = now
+        await session.commit()
+        await session.refresh(file)
+        out = FileOut.model_validate(file)
+
+    await orchestrate_file(file_id, job_manager.enqueue)
+    return out
 
 
 class ChunkJobOut(BaseModel):
@@ -504,11 +548,21 @@ def _severity_rank(severity: str) -> int:
     }.get(severity.lower(), 99)
 
 
-def _subtitle_event_editor_out(event: SubtitleEvent) -> SubtitleEventEditorOut:
+def _subtitle_event_editor_out(
+    event: SubtitleEvent,
+    speaker_character_map: dict[str, tuple[str, CharacterGender | None]] | None = None,
+) -> SubtitleEventEditorOut:
     issues = sorted(
         [item for item in event.qa_items if not item.is_resolved],
         key=lambda item: (_severity_rank(item.severity), item.created_at, item.id),
     )
+    speaker_name = event.name.strip() if event.name and event.name.strip() else None
+    character_name = None
+    character_gender = None
+    if speaker_name and speaker_character_map:
+        mapped = speaker_character_map.get(speaker_name.lower())
+        if mapped:
+            character_name, character_gender = mapped
     return SubtitleEventEditorOut(
         id=event.id,
         file_id=event.file_id,
@@ -517,11 +571,32 @@ def _subtitle_event_editor_out(event: SubtitleEvent) -> SubtitleEventEditorOut:
         source_text=event.source_text,
         translated_text=event.translated_text,
         original_ai_translated_text=event.original_ai_translated_text,
+        speaker_name=speaker_name,
+        character_name=character_name,
+        character_gender=character_gender,
         is_user_edited=bool(event.is_user_edited),
         is_locked=bool(event.is_locked),
         is_approved=bool(event.is_approved),
         issues=[QaIssueOut.model_validate(item) for item in issues],
     )
+
+
+async def _speaker_character_map(session, project_id: int) -> dict[str, tuple[str, CharacterGender | None]]:
+    speakers = list((await session.scalars(
+        select(ProjectSpeaker)
+        .where(ProjectSpeaker.project_id == project_id)
+        .options(
+            selectinload(ProjectSpeaker.character_mappings)
+            .selectinload(SpeakerCharacterMapping.character)
+        )
+    )).all())
+    result: dict[str, tuple[str, CharacterGender | None]] = {}
+    for speaker in speakers:
+        mapping = next((m for m in speaker.character_mappings if m.character is not None), None)
+        if mapping is None:
+            continue
+        result[speaker.name.lower()] = (mapping.character.name, mapping.character.gender)
+    return result
 
 
 @router.get("/{project_id}/files/{file_id}/subtitle-events", response_model=list[SubtitleEventEditorOut])
@@ -537,8 +612,9 @@ async def list_file_subtitle_events(project_id: int, file_id: int):
             .options(selectinload(SubtitleEvent.qa_items))
             .order_by(SubtitleEvent.line_index)
         )).all())
+        speaker_map = await _speaker_character_map(session, project_id)
 
-        return [_subtitle_event_editor_out(event) for event in events]
+        return [_subtitle_event_editor_out(event, speaker_map) for event in events]
 
 
 @router.put("/{project_id}/files/{file_id}/subtitle-events/{event_id}", response_model=SubtitleEventEditorOut)
@@ -566,7 +642,8 @@ async def update_file_subtitle_event(
         event.updated_at = datetime.utcnow().isoformat()
         await session.commit()
         await session.refresh(event, ["qa_items"])
-        return _subtitle_event_editor_out(event)
+        speaker_map = await _speaker_character_map(session, project_id)
+        return _subtitle_event_editor_out(event, speaker_map)
 
 
 @router.post("/{project_id}/files/{file_id}/subtitle-events/{event_id}/revert", response_model=SubtitleEventEditorOut)
@@ -595,7 +672,8 @@ async def revert_file_subtitle_event(
         event.updated_at = datetime.utcnow().isoformat()
         await session.commit()
         await session.refresh(event, ["qa_items"])
-        return _subtitle_event_editor_out(event)
+        speaker_map = await _speaker_character_map(session, project_id)
+        return _subtitle_event_editor_out(event, speaker_map)
 
 
 @router.post("/{project_id}/files/{file_id}/qa-issues/{issue_id}/resolve", response_model=SubtitleEventEditorOut)
@@ -623,7 +701,8 @@ async def resolve_file_qa_issue(project_id: int, file_id: int, issue_id: int):
         )
         if event is None:
             raise HTTPException(status_code=404, detail="Subtitle event not found")
-        out = _subtitle_event_editor_out(event)
+        speaker_map = await _speaker_character_map(session, project_id)
+        out = _subtitle_event_editor_out(event, speaker_map)
 
     await orchestrate_file(file_id, job_manager.enqueue)
     return out

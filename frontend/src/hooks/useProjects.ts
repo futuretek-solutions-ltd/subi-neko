@@ -98,6 +98,26 @@ export function useRetryChunk(projectId: number, fileId: number) {
   });
 }
 
+export function useAcceptFileReview(projectId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (fileId: number) => {
+      const { data } = await client.post<VideoFile>(
+        `/projects/${projectId}/files/${fileId}/accept-review`,
+      );
+      return data;
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData<VideoFile[]>(
+        ['projects', projectId, 'files'],
+        (files) => files?.map((file) => (file.id === data.id ? { ...file, ...data } : file)),
+      );
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'files', data.id, 'chunks'] });
+    },
+  });
+}
+
 /** Invalidate project + file queries when a job completes — call inside useJobSocket. */
 export function useInvalidateProjectsOnJob() {
   // No-op — invalidation is now handled inside useJobSocket directly.

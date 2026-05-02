@@ -16,7 +16,6 @@ from app.db.models import (
     JobRecord,
     JobStatus,
     Project,
-    QaItem,
     Subtitle,
     SubtitleChunk,
     SubtitleEvent,
@@ -147,7 +146,8 @@ async def _handle_waiting(
         FileBlockingReason.TRANSLATION_FAILED.value,
         FileBlockingReason.VALIDATION_FAILED.value,
     ):
-        await orchestrate_chunks(file_id, project.id, enqueue_fn)
+        all_complete = await orchestrate_chunks(file_id, project.id, enqueue_fn)
+        await _handle_chunks_result(file_id, project.id, enqueue_fn, all_complete)
         return
 
     # All other blocking reasons: wait for user/manual action
@@ -190,7 +190,15 @@ async def _handle_processing(
     file_id: int, project_id: int, enqueue_fn: EnqueueFn,
 ) -> None:
     all_complete = await orchestrate_chunks(file_id, project_id, enqueue_fn)
+    await _handle_chunks_result(file_id, project_id, enqueue_fn, all_complete)
 
+
+async def _handle_chunks_result(
+    file_id: int,
+    project_id: int,
+    enqueue_fn: EnqueueFn,
+    all_complete: bool | None,
+) -> None:
     if all_complete is None:
         # One or more chunks are in a terminal error state — determine blocking reason.
         await _set_file_blocked_by_chunks(file_id)
@@ -199,50 +207,24 @@ async def _handle_processing(
     if not all_complete:
         return
 
-    # All chunks complete — check for unresolved QA
-    async with AsyncSessionLocal() as session:
-        unresolved_qa_count = await session.scalar(
-            select(func.count())
-            .select_from(QaItem)
-            .where(
-                QaItem.file_id == file_id,
-                QaItem.is_resolved == 0,
-            )
-        )
-
-    if unresolved_qa_count > 0:
-        await _set_file_status(
-            file_id,
-            FileStatus.REVIEW_REQUIRED.value,
-            FileBlockingReason.USER_REVIEW_REQUIRED.value,
-        )
-    else:
-        await _set_file_status(file_id, FileStatus.MUXING.value, None)
-        await _handle_muxing(file_id, project_id, enqueue_fn)
+    # All chunks complete. Muxing must be explicitly accepted by the user,
+    # even when there are no unresolved QA items.
+    await _set_file_status(
+        file_id,
+        FileStatus.REVIEW_REQUIRED.value,
+        FileBlockingReason.USER_REVIEW_REQUIRED.value,
+    )
 
 
 async def _handle_review_required(
     file_id: int, project_id: int, enqueue_fn: EnqueueFn,
 ) -> None:
-    async with AsyncSessionLocal() as session:
-        unresolved_qa_count = await session.scalar(
-            select(func.count())
-            .select_from(QaItem)
-            .where(
-                QaItem.file_id == file_id,
-                QaItem.is_resolved == 0,
-            )
-        )
-
-    if unresolved_qa_count > 0:
-        await _set_file_status(
-            file_id,
-            FileStatus.REVIEW_REQUIRED.value,
-            FileBlockingReason.USER_REVIEW_REQUIRED.value,
-        )
-    else:
-        await _set_file_status(file_id, FileStatus.MUXING.value, None)
-        await _handle_muxing(file_id, project_id, enqueue_fn)
+    # Stay in review until the user explicitly accepts the file.
+    await _set_file_status(
+        file_id,
+        FileStatus.REVIEW_REQUIRED.value,
+        FileBlockingReason.USER_REVIEW_REQUIRED.value,
+    )
 
 
 async def _handle_muxing(file_id: int, project_id: int, enqueue_fn: EnqueueFn) -> None:

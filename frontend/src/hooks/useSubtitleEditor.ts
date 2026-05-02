@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import client from '../api/client';
-import type { SubtitleEventEditorRow } from '../types';
+import type { ProjectStats, SubtitleEventEditorRow, VideoFile } from '../types';
 
 interface UpdateSubtitleEventPayload {
   projectId: number;
@@ -51,7 +51,6 @@ export function useUpdateSubtitleEvent() {
         ['projects', variables.projectId, 'files', variables.fileId, 'subtitle-events'],
         (rows) => rows?.map((row) => (row.id === data.id ? data : row)),
       );
-      queryClient.invalidateQueries({ queryKey: ['projects', variables.projectId, 'files'] });
     },
   });
 }
@@ -70,7 +69,6 @@ export function useRevertSubtitleEvent() {
         ['projects', variables.projectId, 'files', variables.fileId, 'subtitle-events'],
         (rows) => rows?.map((row) => (row.id === data.id ? data : row)),
       );
-      queryClient.invalidateQueries({ queryKey: ['projects', variables.projectId, 'files'] });
     },
   });
 }
@@ -84,14 +82,43 @@ export function useResolveQaIssue() {
       );
       return data;
     },
-    onSuccess: (data, variables) => {
+    onMutate: async (variables) => {
+      const queryKey = ['projects', variables.projectId, 'files', variables.fileId, 'subtitle-events'];
+      const rows = queryClient.getQueryData<SubtitleEventEditorRow[]>(queryKey);
+      const issue = rows
+        ?.flatMap((row) => row.issues)
+        .find((item) => item.id === variables.issueId);
+      return { issue };
+    },
+    onSuccess: (data, variables, context) => {
       queryClient.setQueryData<SubtitleEventEditorRow[]>(
         ['projects', variables.projectId, 'files', variables.fileId, 'subtitle-events'],
         (rows) => rows?.map((row) => (row.id === data.id ? data : row)),
       );
-      queryClient.invalidateQueries({ queryKey: ['projects', variables.projectId, 'files', variables.fileId, 'chunks'] });
-      queryClient.invalidateQueries({ queryKey: ['projects', variables.projectId, 'files'] });
-      queryClient.invalidateQueries({ queryKey: ['projects', variables.projectId, 'stats'] });
+      const issue = context?.issue;
+      if (!issue) return;
+      const isError = ['critical', 'error', 'high'].includes(issue.severity.toLowerCase());
+      queryClient.setQueryData<VideoFile[]>(
+        ['projects', variables.projectId, 'files'],
+        (files) => files?.map((file) => {
+          if (file.id !== variables.fileId) return file;
+          return {
+            ...file,
+            qa_issues: Math.max(0, file.qa_issues - 1),
+            qa_errors: isError ? Math.max(0, file.qa_errors - 1) : file.qa_errors,
+            qa_warnings: isError ? file.qa_warnings : Math.max(0, file.qa_warnings - 1),
+          };
+        }),
+      );
+      queryClient.setQueryData<ProjectStats>(
+        ['projects', variables.projectId, 'stats'],
+        (stats) => stats
+          ? {
+              qa_errors: isError ? Math.max(0, stats.qa_errors - 1) : stats.qa_errors,
+              qa_warnings: isError ? stats.qa_warnings : Math.max(0, stats.qa_warnings - 1),
+            }
+          : stats,
+      );
     },
   });
 }

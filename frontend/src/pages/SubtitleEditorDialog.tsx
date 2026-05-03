@@ -188,11 +188,13 @@ const SubtitleRow = memo(function SubtitleRow({
   onBlurSave,
   onRevert,
   onResolve,
-  watchedMatches,
+  originalWatchedWords,
+  translatedWatchedWords,
 }: {
   row: SubtitleEventEditorRow;
   draft: SubtitleDraft;
-  watchedMatches: WatchedWordMatches;
+  originalWatchedWords: ProjectWatchedWord[];
+  translatedWatchedWords: ProjectWatchedWord[];
   resolvingIssueId: number | null;
   saving: boolean;
   reverting: boolean;
@@ -204,6 +206,10 @@ const SubtitleRow = memo(function SubtitleRow({
   const issues = sortIssues(row.issues);
   const canRevert = row.original_ai_translated_text !== null
     && draft.translated_text !== row.original_ai_translated_text;
+  const watchedMatches = useMemo<WatchedWordMatches>(() => ({
+    original: matchingWatchedWords(row.source_text, originalWatchedWords),
+    translated: matchingWatchedWords(draft.translated_text, translatedWatchedWords),
+  }), [draft.translated_text, originalWatchedWords, row.source_text, translatedWatchedWords]);
   const hasWatchedMatch = watchedMatches.original.length > 0 || watchedMatches.translated.length > 0;
   const identityName = row.character_name ?? row.speaker_name;
   const identityGender = row.character_name ? row.character_gender : row.speaker_gender;
@@ -291,7 +297,8 @@ const SubtitleRow = memo(function SubtitleRow({
 }, (prev, next) => (
   prev.row === next.row
   && prev.draft === next.draft
-  && prev.watchedMatches === next.watchedMatches
+  && prev.originalWatchedWords === next.originalWatchedWords
+  && prev.translatedWatchedWords === next.translatedWatchedWords
   && prev.saving === next.saving
   && prev.reverting === next.reverting
   && !prev.row.issues.some((issue) => issue.id === prev.resolvingIssueId || issue.id === next.resolvingIssueId)
@@ -366,17 +373,6 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
     original: watchedWords.filter((word) => word.word_type === 'original'),
     translated: watchedWords.filter((word) => word.word_type === 'translated'),
   }), [watchedWords]);
-  const watchedMatchesByRow = useMemo(() => {
-    const matches = new Map<number, WatchedWordMatches>();
-    for (const row of rows) {
-      const draft = drafts[row.id];
-      matches.set(row.id, {
-        original: matchingWatchedWords(row.source_text, watchedWordsByType.original),
-        translated: matchingWatchedWords(draft?.translated_text ?? row.translated_text, watchedWordsByType.translated),
-      });
-    }
-    return matches;
-  }, [drafts, rows, watchedWordsByType]);
   const isBusy = updateSubtitleEvent.isPending || revertSubtitleEvent.isPending || resolveQaIssue.isPending;
 
   const handleDraftChange = useCallback((eventId: number, translatedText: string) => {
@@ -548,7 +544,8 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
                         key={row.id}
                         row={row}
                         draft={drafts[row.id]}
-                        watchedMatches={watchedMatchesByRow.get(row.id) ?? { original: [], translated: [] }}
+                        originalWatchedWords={watchedWordsByType.original}
+                        translatedWatchedWords={watchedWordsByType.translated}
                         resolvingIssueId={resolvingIssueId}
                         saving={savingEventId === row.id}
                         reverting={revertingEventId === row.id}

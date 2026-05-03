@@ -23,6 +23,7 @@ import {
   useProjectCharacters,
   useProjectSpeakers,
   useUpdateCharacter,
+  useUpdateSpeaker,
   useCompleteMapping,
 } from '../hooks/useCharacterMapping';
 
@@ -35,6 +36,13 @@ interface CharacterDraft {
 }
 
 type DraftMap = Record<number, CharacterDraft>;
+
+interface SpeakerDraft {
+  gender: string | null;
+  dirty: boolean;
+}
+
+type SpeakerDraftMap = Record<number, SpeakerDraft>;
 
 const GENDER_OPTIONS = [
   { value: 'male', label: 'Male' },
@@ -161,8 +169,10 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
   const characters = useMemo(() => sortCharacters(rawCharacters), [rawCharacters]);
 
   const updateCharacter = useUpdateCharacter();
+  const updateSpeaker = useUpdateSpeaker();
   const completeMapping = useCompleteMapping();
   const [drafts, setDrafts] = useState<DraftMap>({});
+  const [speakerDrafts, setSpeakerDrafts] = useState<SpeakerDraftMap>({});
 
   useEffect(() => {
     if (characters.length === 0) return;
@@ -183,8 +193,53 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
     });
   }, [characters]);
 
+  useEffect(() => {
+    if (speakers.length === 0) return;
+    setSpeakerDrafts((prev) => {
+      const next: SpeakerDraftMap = { ...prev };
+      for (const speaker of speakers) {
+        if (!next[speaker.id] || !next[speaker.id].dirty) {
+          next[speaker.id] = {
+            gender: speaker.gender,
+            dirty: false,
+          };
+        }
+      }
+      return next;
+    });
+  }, [speakers]);
+
   function handleDraftChange(characterId: number, patch: Partial<Omit<CharacterDraft, 'dirty'>>) {
+    const currentDraft = drafts[characterId];
+    const character = characters.find((item) => item.id === characterId);
+    if (patch.speaker_ids && currentDraft && character) {
+      const previousSpeakerIds = new Set(currentDraft.speaker_ids);
+      const addedSpeakerIds = patch.speaker_ids.filter((speakerId) => !previousSpeakerIds.has(speakerId));
+      const inheritedGender = patch.gender ?? currentDraft.gender ?? character.gender;
+      if (inheritedGender && addedSpeakerIds.length > 0) {
+        setSpeakerDrafts((prev) => {
+          let changed = false;
+          const next: SpeakerDraftMap = { ...prev };
+          for (const speakerId of addedSpeakerIds) {
+            const speaker = speakers.find((item) => item.id === speakerId);
+            const speakerDraft = next[speakerId] ?? { gender: speaker?.gender ?? null, dirty: false };
+            if (!speakerDraft.gender) {
+              next[speakerId] = { ...speakerDraft, gender: inheritedGender, dirty: true };
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+      }
+    }
     setDrafts((prev) => ({ ...prev, [characterId]: { ...prev[characterId], ...patch, dirty: true } }));
+  }
+
+  function handleSpeakerDraftChange(speakerId: number, patch: Partial<Omit<SpeakerDraft, 'dirty'>>) {
+    setSpeakerDrafts((prev) => ({
+      ...prev,
+      [speakerId]: { ...prev[speakerId], ...patch, dirty: true },
+    }));
   }
 
   const liveSpeakerCounts = useMemo<Record<number, number>>(() => {
@@ -201,33 +256,50 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
   );
 
   const dirtyCount = Object.values(drafts).filter((d) => d.dirty).length;
+  const dirtySpeakerCount = Object.values(speakerDrafts).filter((d) => d.dirty).length;
+  const totalDirtyCount = dirtyCount + dirtySpeakerCount;
   const isLoading = charsLoading || speakersLoading;
-  const isBusy = updateCharacter.isPending || completeMapping.isPending;
+  const isBusy = updateCharacter.isPending || updateSpeaker.isPending || completeMapping.isPending;
   const unmappedSpeakers = speakers.filter((s) => (liveSpeakerCounts[s.id] ?? 0) === 0);
 
   async function handleComplete() {
     const dirtyEntries = Object.entries(drafts).filter(([, d]) => d.dirty);
-    if (dirtyEntries.length > 0) {
+    const dirtySpeakerEntries = Object.entries(speakerDrafts).filter(([, d]) => d.dirty);
+    if (dirtyEntries.length > 0 || dirtySpeakerEntries.length > 0) {
       try {
         await Promise.all(
-          dirtyEntries.map(([idStr, draft]) =>
-            updateCharacter.mutateAsync({
-              projectId,
-              characterId: Number(idStr),
-              gender: draft.gender,
-              social_position: draft.social_position,
-              note: draft.note,
-              speaker_ids: draft.speaker_ids,
-            }),
-          ),
+          [
+            ...dirtyEntries.map(([idStr, draft]) =>
+              updateCharacter.mutateAsync({
+                projectId,
+                characterId: Number(idStr),
+                gender: draft.gender,
+                social_position: draft.social_position,
+                note: draft.note,
+                speaker_ids: draft.speaker_ids,
+              }),
+            ),
+            ...dirtySpeakerEntries.map(([idStr, draft]) =>
+              updateSpeaker.mutateAsync({
+                projectId,
+                speakerId: Number(idStr),
+                gender: draft.gender,
+              }),
+            ),
+          ],
         );
         setDrafts((prev) => {
           const next = { ...prev };
           for (const [idStr] of dirtyEntries) next[Number(idStr)] = { ...next[Number(idStr)], dirty: false };
           return next;
         });
+        setSpeakerDrafts((prev) => {
+          const next = { ...prev };
+          for (const [idStr] of dirtySpeakerEntries) next[Number(idStr)] = { ...next[Number(idStr)], dirty: false };
+          return next;
+        });
       } catch {
-        notifications.show({ color: 'red', title: 'Save failed', message: 'Could not save character changes. Please try again.' });
+        notifications.show({ color: 'red', title: 'Save failed', message: 'Could not save mapping changes. Please try again.' });
         return;
       }
     }
@@ -241,10 +313,11 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
   }
 
   function handleClose() {
-    if (dirtyCount > 0 && !isBusy) {
-      if (!window.confirm(`You have ${dirtyCount} unsaved change(s). Discard and close?`)) return;
+    if (totalDirtyCount > 0 && !isBusy) {
+      if (!window.confirm(`You have ${totalDirtyCount} unsaved change(s). Discard and close?`)) return;
     }
     setDrafts({});
+    setSpeakerDrafts({});
     onClose();
   }
 
@@ -256,7 +329,7 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
         <Group gap="xs">
           <GitMerge size={18} />
           <Text fw={600}>Character Mapping</Text>
-          {dirtyCount > 0 && <Badge size="sm" color="yellow" variant="light">{dirtyCount} unsaved</Badge>}
+          {totalDirtyCount > 0 && <Badge size="sm" color="yellow" variant="light">{totalDirtyCount} unsaved</Badge>}
         </Group>
       }
       size="90%"
@@ -269,7 +342,7 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
       {isLoading ? (
         <Center py="xl"><Loader size="sm" /></Center>
       ) : (
-        <Group align="stretch" gap="md" wrap="nowrap" style={{ flex: 1, minHeight: 0 }}>
+        <Group align="stretch" gap="md" wrap="nowrap" style={{ flex: 1, minHeight: 0, maxHeight: '70vh' }}>
 
           {/* Left card: anime characters */}
           <Card withBorder radius="md" p={0} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -304,7 +377,7 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
           </Card>
 
           {/* Right card: subtitle speakers */}
-          <Card withBorder radius="md" p={0} style={{ width: 240, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <Card withBorder radius="md" p={0} style={{ width: 360, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <Box px="md" py="sm" style={{ borderBottom: '1px solid var(--mantine-color-dark-4)', flexShrink: 0 }}>
               <Group gap="xs" mb={2}>
                 <Microphone size={15} weight="duotone" color="var(--mantine-color-cyan-4)" />
@@ -320,14 +393,27 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
                 ) : (
                   speakers.map((speaker) => {
                     const count = liveSpeakerCounts[speaker.id] ?? 0;
+                    const draft = speakerDrafts[speaker.id];
                     return (
                       <Box key={speaker.id} px="sm" py={10} style={{ borderBottom: '1px solid var(--mantine-color-dark-5)', opacity: count === 0 ? 0.45 : 1 }}>
-                        <Group gap="xs" wrap="nowrap" justify="space-between">
+                        <Group gap="xs" wrap="nowrap" justify="space-between" align="center">
                           <Text size="sm" truncate c={count === 0 ? 'dimmed' : undefined} style={{ flex: 1, minWidth: 0 }}>
                             {speaker.name}
                           </Text>
+                          <Select
+                            size="xs"
+                            placeholder="Gender"
+                            style={{ width: 116, flexShrink: 0 }}
+                            clearable
+                            data={GENDER_OPTIONS}
+                            value={draft?.gender ?? null}
+                            onChange={(value) => handleSpeakerDraftChange(speaker.id, { gender: value })}
+                          />
                           <SpeakerCountBadge count={count} />
                         </Group>
+                        {draft?.dirty && (
+                          <Text size="xs" c="yellow.5" mt={4}>Unsaved</Text>
+                        )}
                       </Box>
                     );
                   })
@@ -339,7 +425,18 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
       )}
 
       {/* Footer */}
-      <Box pt="md" style={{ flexShrink: 0 }}>
+      <Box
+        pt="md"
+        mt="md"
+        style={{
+          flexShrink: 0,
+          position: 'sticky',
+          bottom: 0,
+          backgroundColor: 'var(--mantine-color-dark-7)',
+          borderTop: '1px solid var(--mantine-color-dark-5)',
+          zIndex: 2,
+        }}
+      >
         {unmappedSpeakers.length > 0 && (
           <Group gap="xs" mb="sm">
             <Warning size={14} color="var(--mantine-color-yellow-5)" weight="fill" />
@@ -352,7 +449,7 @@ export function CharacterMappingDialog({ projectId, opened, onClose }: Character
         <Group justify="flex-end" gap="sm">
           <Button variant="default" onClick={handleClose} disabled={isBusy}>Cancel</Button>
           <Button color="pink" leftSection={<GitMerge size={14} />} loading={isBusy} onClick={handleComplete}>
-            {dirtyCount > 0 ? 'Save & Complete Mapping' : 'Complete Mapping'}
+            {totalDirtyCount > 0 ? 'Save & Complete Mapping' : 'Complete Mapping'}
           </Button>
         </Group>
       </Box>

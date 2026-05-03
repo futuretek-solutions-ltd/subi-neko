@@ -12,8 +12,14 @@ from openai import OpenAI
 from sqlalchemy import select
 
 from app.core.database import SyncSessionLocal
-from app.db.models import QaItem, SubtitleChunk, SubtitleEvent
+from app.db.models import File, ProjectCharacter, ProjectSpeaker, QaItem, SubtitleChunk, SubtitleEvent
 from app.jobs.context import JobContext, JobResult, ProgressFn
+from app.jobs.handlers.prompt_context import (
+    build_character_block,
+    build_unmapped_speaker_block,
+    load_prompt_characters,
+    load_unmapped_gendered_speakers,
+)
 from app.jobs.registry import register_job_handler
 
 logger = logging.getLogger(__name__)
@@ -86,8 +92,18 @@ def _format_window(window: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_user_message(windows: list[list[dict]]) -> str:
+def _build_user_message(
+    windows: list[list[dict]],
+    characters: list[ProjectCharacter],
+    unmapped_speakers: list[ProjectSpeaker],
+) -> str:
     sections: list[str] = []
+    char_block = build_character_block(characters)
+    speaker_block = build_unmapped_speaker_block(unmapped_speakers)
+    if char_block:
+        sections.append(f"## Characters\n{char_block}")
+    if speaker_block:
+        sections.append(f"## Unmapped Speakers\n{speaker_block}")
     for idx, window in enumerate(windows, 1):
         sections.append(f"=== Window {idx} ===\n{_format_window(window)}")
     return "\n\n".join(sections)
@@ -122,6 +138,12 @@ def review_chunk_llm(
 
         translate_from = chunk.translate_from_line
         translate_to = chunk.translate_to_line
+        file = session.get(File, file_id)
+        characters: list[ProjectCharacter] = []
+        unmapped_speakers: list[ProjectSpeaker] = []
+        if file is not None:
+            characters = load_prompt_characters(session, file.project_id)
+            unmapped_speakers = load_unmapped_gendered_speakers(session, file.project_id)
 
         events: list[SubtitleEvent] = list(session.scalars(
             select(SubtitleEvent)
@@ -155,6 +177,8 @@ def review_chunk_llm(
             }
             for e in events
         ]
+        char_snapshot = list(characters)
+        speaker_snapshot = list(unmapped_speakers)
 
     if not snapshot:
         return JobResult(status="failed", result=None,
@@ -201,7 +225,7 @@ def review_chunk_llm(
                          error_message="OPENAI_MODEL_BETTER is not configured")
 
     system_prompt = ctx.options.resolved_review_prompt().strip()
-    user_message = _build_user_message(windows)
+    user_message = _build_user_message(windows, char_snapshot, speaker_snapshot)
 
     client = OpenAI(
         api_key=ctx.options.openai_api_key or "no-key",

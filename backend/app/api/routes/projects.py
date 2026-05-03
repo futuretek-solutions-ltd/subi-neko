@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -15,11 +16,13 @@ from app.db.models import (
     Project,
     ProjectCharacter,
     ProjectSpeaker,
+    ProjectWatchedWord,
     ProjectStatus,
     QaItem,
     SpeakerCharacterMapping,
     SubtitleChunk,
     SubtitleEvent,
+    WatchedWordType,
 )
 from app.jobs.manager import job_manager
 from app.metadata.base import CharacterGender
@@ -87,6 +90,7 @@ class CharacterOut(BaseModel):
 
 class CharacterUpdateIn(BaseModel):
     gender: CharacterGender | None = None
+    social_position: str | None = None
     note: str | None = None
     speaker_ids: list[int] = []
 
@@ -95,11 +99,32 @@ class SpeakerOut(BaseModel):
     id: int
     project_id: int
     name: str
+    gender: CharacterGender | None
     created_at: str
     updated_at: str
     mapping_count: int
 
     model_config = {"from_attributes": True}
+
+
+class SpeakerUpdateIn(BaseModel):
+    gender: CharacterGender | None = None
+
+
+class WatchedWordOut(BaseModel):
+    id: int
+    project_id: int
+    word: str
+    word_type: Literal["original", "translated"]
+    created_at: str
+    updated_at: str
+
+    model_config = {"from_attributes": True}
+
+
+class WatchedWordCreateIn(BaseModel):
+    word: str = Field(min_length=1, max_length=200)
+    word_type: Literal["original", "translated"]
 
 
 class QaIssueOut(BaseModel):
@@ -128,6 +153,7 @@ class SubtitleEventEditorOut(BaseModel):
     translated_text: str | None
     original_ai_translated_text: str | None
     speaker_name: str | None
+    speaker_gender: CharacterGender | None
     character_name: str | None
     character_gender: CharacterGender | None
     is_user_edited: bool
@@ -208,6 +234,63 @@ async def delete_project(project_id: int):
         if project is not None:
             await session.delete(project)
             await session.commit()
+
+
+@router.get("/{project_id}/watched-words", response_model=list[WatchedWordOut])
+async def list_project_watched_words(project_id: int):
+    async with AsyncSessionLocal() as session:
+        project = await session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        rows = await session.scalars(
+            select(ProjectWatchedWord)
+            .where(ProjectWatchedWord.project_id == project_id)
+            .order_by(ProjectWatchedWord.word_type, func.lower(ProjectWatchedWord.word))
+        )
+        return list(rows.all())
+
+
+@router.post("/{project_id}/watched-words", response_model=WatchedWordOut, status_code=201)
+async def create_project_watched_word(project_id: int, body: WatchedWordCreateIn):
+    word = body.word.strip()
+    if not word:
+        raise HTTPException(status_code=422, detail="Word must not be blank")
+    if body.word_type not in {WatchedWordType.ORIGINAL.value, WatchedWordType.TRANSLATED.value}:
+        raise HTTPException(status_code=422, detail="Invalid watched word type")
+
+    async with AsyncSessionLocal() as session:
+        project = await session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        duplicate = await session.scalar(
+            select(ProjectWatchedWord)
+            .where(ProjectWatchedWord.project_id == project_id)
+            .where(ProjectWatchedWord.word_type == body.word_type)
+            .where(func.lower(ProjectWatchedWord.word) == word.lower())
+        )
+        if duplicate is not None:
+            raise HTTPException(status_code=409, detail="Watched word already exists for this type")
+
+        watched_word = ProjectWatchedWord(
+            project_id=project_id,
+            word=word,
+            word_type=body.word_type,
+        )
+        session.add(watched_word)
+        await session.commit()
+        await session.refresh(watched_word)
+        return watched_word
+
+
+@router.delete("/{project_id}/watched-words/{watched_word_id}", status_code=204)
+async def delete_project_watched_word(project_id: int, watched_word_id: int):
+    async with AsyncSessionLocal() as session:
+        watched_word = await session.get(ProjectWatchedWord, watched_word_id)
+        if watched_word is None or watched_word.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Watched word not found")
+        await session.delete(watched_word)
+        await session.commit()
 
 
 @router.get("/{project_id}/files", response_model=list[FileOut])
@@ -550,19 +633,20 @@ def _severity_rank(severity: str) -> int:
 
 def _subtitle_event_editor_out(
     event: SubtitleEvent,
-    speaker_character_map: dict[str, tuple[str, CharacterGender | None]] | None = None,
+    speaker_character_map: dict[str, tuple[str | None, CharacterGender | None, CharacterGender | None]] | None = None,
 ) -> SubtitleEventEditorOut:
     issues = sorted(
         [item for item in event.qa_items if not item.is_resolved],
         key=lambda item: (_severity_rank(item.severity), item.created_at, item.id),
     )
     speaker_name = event.name.strip() if event.name and event.name.strip() else None
+    speaker_gender = None
     character_name = None
     character_gender = None
     if speaker_name and speaker_character_map:
         mapped = speaker_character_map.get(speaker_name.lower())
         if mapped:
-            character_name, character_gender = mapped
+            character_name, character_gender, speaker_gender = mapped
     return SubtitleEventEditorOut(
         id=event.id,
         file_id=event.file_id,
@@ -572,6 +656,7 @@ def _subtitle_event_editor_out(
         translated_text=event.translated_text,
         original_ai_translated_text=event.original_ai_translated_text,
         speaker_name=speaker_name,
+        speaker_gender=speaker_gender,
         character_name=character_name,
         character_gender=character_gender,
         is_user_edited=bool(event.is_user_edited),
@@ -581,7 +666,7 @@ def _subtitle_event_editor_out(
     )
 
 
-async def _speaker_character_map(session, project_id: int) -> dict[str, tuple[str, CharacterGender | None]]:
+async def _speaker_character_map(session, project_id: int) -> dict[str, tuple[str | None, CharacterGender | None, CharacterGender | None]]:
     speakers = list((await session.scalars(
         select(ProjectSpeaker)
         .where(ProjectSpeaker.project_id == project_id)
@@ -590,12 +675,14 @@ async def _speaker_character_map(session, project_id: int) -> dict[str, tuple[st
             .selectinload(SpeakerCharacterMapping.character)
         )
     )).all())
-    result: dict[str, tuple[str, CharacterGender | None]] = {}
+    result: dict[str, tuple[str | None, CharacterGender | None, CharacterGender | None]] = {}
     for speaker in speakers:
         mapping = next((m for m in speaker.character_mappings if m.character is not None), None)
-        if mapping is None:
-            continue
-        result[speaker.name.lower()] = (mapping.character.name, mapping.character.gender)
+        result[speaker.name.lower()] = (
+            mapping.character.name if mapping is not None else None,
+            mapping.character.gender if mapping is not None else None,
+            speaker.gender,
+        )
     return result
 
 
@@ -750,12 +837,43 @@ async def list_project_speakers(project_id: int):
         return [
             SpeakerOut(
                 **{c: getattr(s, c) for c in [
-                    "id", "project_id", "name", "created_at", "updated_at",
+                    "id", "project_id", "name", "gender", "created_at", "updated_at",
                 ]},
                 mapping_count=len(s.character_mappings),
             )
             for s in speakers
         ]
+
+
+@router.put("/{project_id}/speakers/{speaker_id}", response_model=SpeakerOut)
+async def update_project_speaker(project_id: int, speaker_id: int, body: SpeakerUpdateIn):
+    async with AsyncSessionLocal() as session:
+        project = await session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        speaker = await session.get(
+            ProjectSpeaker,
+            speaker_id,
+            options=[selectinload(ProjectSpeaker.character_mappings)],
+        )
+        if speaker is None or speaker.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Speaker not found")
+
+        speaker.gender = body.gender.value if isinstance(body.gender, CharacterGender) else body.gender
+        speaker.updated_at = datetime.utcnow().isoformat()
+        await session.commit()
+        await session.refresh(speaker, ["character_mappings"])
+
+        return SpeakerOut(
+            id=speaker.id,
+            project_id=speaker.project_id,
+            name=speaker.name,
+            gender=speaker.gender,
+            created_at=speaker.created_at,
+            updated_at=speaker.updated_at,
+            mapping_count=len(speaker.character_mappings),
+        )
 
 
 @router.put("/{project_id}/characters/{character_id}", response_model=CharacterOut)

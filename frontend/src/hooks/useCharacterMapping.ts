@@ -11,6 +11,12 @@ interface CharacterUpdatePayload {
   speaker_ids: number[];
 }
 
+interface SpeakerUpdatePayload {
+  projectId: number;
+  speakerId: number;
+  gender: string | null;
+}
+
 export function useProjectCharacters(projectId: number | null) {
   return useQuery<ProjectCharacterWithSpeakers[]>({
     queryKey: ['projects', projectId, 'characters'],
@@ -56,6 +62,24 @@ export function useUpdateCharacter() {
       queryClient.invalidateQueries({
         queryKey: ['projects', variables.projectId, 'characters'],
       });
+      queryClient.invalidateQueries({
+        queryKey: ['projects', variables.projectId, 'speakers'],
+      });
+    },
+  });
+}
+
+export function useUpdateSpeaker() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: SpeakerUpdatePayload) => {
+      const { data } = await client.put<ProjectSpeakerWithCount>(
+        `/projects/${payload.projectId}/speakers/${payload.speakerId}`,
+        { gender: payload.gender },
+      );
+      return data;
+    },
+    onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({
         queryKey: ['projects', variables.projectId, 'speakers'],
       });

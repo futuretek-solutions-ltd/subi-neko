@@ -18,8 +18,9 @@ import {
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import { ArrowCounterClockwise, CheckCircle, NotePencil, WarningCircle } from '@phosphor-icons/react';
-import type { QaIssue, SubtitleEventEditorRow, VideoFile } from '../types';
+import type { ProjectWatchedWord, QaIssue, SubtitleEventEditorRow, VideoFile } from '../types';
 import { useResolveQaIssue, useRevertSubtitleEvent, useSubtitleEvents, useUpdateSubtitleEvent } from '../hooks/useSubtitleEditor';
+import { useProjectWatchedWords } from '../hooks/useProjects';
 
 interface SubtitleDraft {
   translated_text: string;
@@ -48,6 +49,19 @@ const SEVERITY_RANK: Record<string, number> = {
   low: 3,
 };
 
+const GENDER_COLORS: Record<string, string> = {
+  female: 'pink',
+  male: 'blue',
+  non_binary: 'gray',
+  other: 'gray',
+};
+
+const NON_BINARY_BADGE_STYLE = {
+  color: '#b7791f',
+  borderColor: '#b7791f',
+  backgroundColor: 'rgba(183, 121, 31, 0.12)',
+};
+
 function sortIssues(issues: QaIssue[]) {
   return [...issues].sort((a, b) => {
     const ar = SEVERITY_RANK[a.severity.toLowerCase()] ?? 99;
@@ -55,6 +69,59 @@ function sortIssues(issues: QaIssue[]) {
     if (ar !== br) return ar - br;
     return a.id - b.id;
   });
+}
+
+interface WatchedWordMatches {
+  original: ProjectWatchedWord[];
+  translated: ProjectWatchedWord[];
+}
+
+function matchingWatchedWords(text: string | null | undefined, words: ProjectWatchedWord[]) {
+  const haystack = (text ?? '').toLocaleLowerCase();
+  if (!haystack) return [];
+  return words.filter((word) => haystack.includes(word.word.toLocaleLowerCase()));
+}
+
+function WatchedWordBadges({ words }: { words: ProjectWatchedWord[] }) {
+  if (words.length === 0) return null;
+  return (
+    <Group gap={4} mt={5}>
+      {words.map((word) => (
+        <Badge key={word.id} size="xs" color="yellow" variant="light" title={`Watched word: ${word.word}`}>
+          {word.word}
+        </Badge>
+      ))}
+    </Group>
+  );
+}
+
+function IdentityBadges({
+  name,
+  gender,
+}: {
+  name: string;
+  gender: string | null;
+}) {
+  return (
+    <Group gap={4} mt={8} wrap="nowrap" style={{ minWidth: 0 }}>
+      <Badge size="xs" variant="light" color="blue" style={{ maxWidth: 112, minWidth: 0 }}>
+        <Text size="xs" truncate title={name}>{name}</Text>
+      </Badge>
+      {gender && (
+        <Badge
+          size="xs"
+          variant="outline"
+          color={GENDER_COLORS[gender] ?? 'gray'}
+          style={{
+            flexShrink: 0,
+            ...(gender === 'non_binary' ? NON_BINARY_BADGE_STYLE : {}),
+          }}
+        >
+          {gender}
+        </Badge>
+      )}
+    </Group>
+  );
 }
 
 function IssueRow({
@@ -121,9 +188,11 @@ const SubtitleRow = memo(function SubtitleRow({
   onBlurSave,
   onRevert,
   onResolve,
+  watchedMatches,
 }: {
   row: SubtitleEventEditorRow;
   draft: SubtitleDraft;
+  watchedMatches: WatchedWordMatches;
   resolvingIssueId: number | null;
   saving: boolean;
   reverting: boolean;
@@ -135,36 +204,29 @@ const SubtitleRow = memo(function SubtitleRow({
   const issues = sortIssues(row.issues);
   const canRevert = row.original_ai_translated_text !== null
     && draft.translated_text !== row.original_ai_translated_text;
+  const hasWatchedMatch = watchedMatches.original.length > 0 || watchedMatches.translated.length > 0;
+  const identityName = row.character_name ?? row.speaker_name;
+  const identityGender = row.character_name ? row.character_gender : row.speaker_gender;
 
   return (
-    <Table.Tr style={{ backgroundColor: draft.dirty ? 'var(--mantine-color-dark-6)' : undefined }}>
-      <Table.Td style={{ width: 86, verticalAlign: 'top' }}>
-        <Group gap={6} wrap="nowrap">
-          <Text size="sm" fw={600}>{row.line_index + 1}</Text>
+    <Table.Tr
+      style={{
+        backgroundColor: hasWatchedMatch
+          ? 'rgba(250, 176, 5, 0.08)'
+          : draft.dirty ? 'var(--mantine-color-dark-6)' : undefined,
+      }}
+    >
+      <Table.Td style={{ width: 160, verticalAlign: 'top' }}>
+        <Group gap={6} wrap="nowrap" align="center">
+          <Text size="sm" fw={700}>{row.line_index + 1}</Text>
           {draft.dirty && (
             <Tooltip label="Unsaved changes" withArrow>
               <Box style={{ width: 7, height: 7, borderRadius: '50%', backgroundColor: 'var(--mantine-color-orange-5)', flexShrink: 0 }} />
             </Tooltip>
           )}
         </Group>
-        {row.speaker_name && (
-          <Stack gap={2} mt={8}>
-            <Text size="xs" c="dimmed" truncate title={row.speaker_name}>
-              {row.speaker_name}
-            </Text>
-            {row.character_name && (
-              <Group gap={4} wrap="nowrap">
-                <Badge size="xs" variant="light" color="blue" style={{ maxWidth: 82 }}>
-                  <Text size="xs" truncate>{row.character_name}</Text>
-                </Badge>
-                {row.character_gender && (
-                  <Badge size="xs" variant="outline" color="gray">
-                    {row.character_gender}
-                  </Badge>
-                )}
-              </Group>
-            )}
-          </Stack>
+        {identityName && (
+          <IdentityBadges name={identityName} gender={identityGender} />
         )}
       </Table.Td>
       <Table.Td style={{ width: '30%', verticalAlign: 'top' }}>
@@ -176,6 +238,7 @@ const SubtitleRow = memo(function SubtitleRow({
           readOnly
           styles={{ input: { fontSize: 13, lineHeight: 1.35 } }}
         />
+        <WatchedWordBadges words={watchedMatches.original} />
       </Table.Td>
       <Table.Td style={{ width: '30%', verticalAlign: 'top' }}>
         <Group gap={6} align="flex-start" wrap="nowrap">
@@ -204,6 +267,7 @@ const SubtitleRow = memo(function SubtitleRow({
             </ActionIcon>
           </Tooltip>
         </Group>
+        <WatchedWordBadges words={watchedMatches.translated} />
         {saving && <Text size="xs" c="dimmed" mt={4}>Saving…</Text>}
       </Table.Td>
       <Table.Td style={{ verticalAlign: 'top' }}>
@@ -227,6 +291,7 @@ const SubtitleRow = memo(function SubtitleRow({
 }, (prev, next) => (
   prev.row === next.row
   && prev.draft === next.draft
+  && prev.watchedMatches === next.watchedMatches
   && prev.saving === next.saving
   && prev.reverting === next.reverting
   && !prev.row.issues.some((issue) => issue.id === prev.resolvingIssueId || issue.id === next.resolvingIssueId)
@@ -242,6 +307,7 @@ interface SubtitleEditorDialogProps {
 export function SubtitleEditorDialog({ projectId, file, opened, onClose }: SubtitleEditorDialogProps) {
   const fileId = file?.id ?? null;
   const { data: rows = [], isLoading } = useSubtitleEvents(projectId, fileId, opened);
+  const { data: watchedWords = [] } = useProjectWatchedWords(projectId, opened);
   const updateSubtitleEvent = useUpdateSubtitleEvent();
   const revertSubtitleEvent = useRevertSubtitleEvent();
   const resolveQaIssue = useResolveQaIssue();
@@ -296,6 +362,21 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
     () => (issuesOnly ? rows.filter((row) => row.issues.length > 0) : rows),
     [issuesOnly, rows],
   );
+  const watchedWordsByType = useMemo(() => ({
+    original: watchedWords.filter((word) => word.word_type === 'original'),
+    translated: watchedWords.filter((word) => word.word_type === 'translated'),
+  }), [watchedWords]);
+  const watchedMatchesByRow = useMemo(() => {
+    const matches = new Map<number, WatchedWordMatches>();
+    for (const row of rows) {
+      const draft = drafts[row.id];
+      matches.set(row.id, {
+        original: matchingWatchedWords(row.source_text, watchedWordsByType.original),
+        translated: matchingWatchedWords(draft?.translated_text ?? row.translated_text, watchedWordsByType.translated),
+      });
+    }
+    return matches;
+  }, [drafts, rows, watchedWordsByType]);
   const isBusy = updateSubtitleEvent.isPending || revertSubtitleEvent.isPending || resolveQaIssue.isPending;
 
   const handleDraftChange = useCallback((eventId: number, translatedText: string) => {
@@ -454,9 +535,9 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
               <Table striped highlightOnHover withColumnBorders style={{ tableLayout: 'fixed' }}>
                 <Table.Thead style={{ position: 'sticky', top: 0, zIndex: 1, backgroundColor: 'var(--mantine-color-dark-7)' }}>
                   <Table.Tr>
-                    <Table.Th style={{ width: 86 }}>Event</Table.Th>
-                    <Table.Th style={{ width: '30%' }}>English text</Table.Th>
-                    <Table.Th style={{ width: '30%' }}>Translation</Table.Th>
+                    <Table.Th style={{ width: 160 }}>Event</Table.Th>
+                    <Table.Th style={{ width: '28%' }}>English text</Table.Th>
+                    <Table.Th style={{ width: '28%' }}>Translation</Table.Th>
                     <Table.Th>Issues</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
@@ -467,6 +548,7 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
                         key={row.id}
                         row={row}
                         draft={drafts[row.id]}
+                        watchedMatches={watchedMatchesByRow.get(row.id) ?? { original: [], translated: [] }}
                         resolvingIssueId={resolvingIssueId}
                         saving={savingEventId === row.id}
                         reverting={revertingEventId === row.id}

@@ -11,25 +11,17 @@ from openai import OpenAI
 from sqlalchemy import select
 
 from app.core.database import SyncSessionLocal
-from app.db.models import File, ProjectCharacter, SubtitleChunk, SubtitleEvent
+from app.db.models import File, ProjectCharacter, ProjectSpeaker, SubtitleChunk, SubtitleEvent
 from app.jobs.context import JobContext, JobResult, ProgressFn
+from app.jobs.handlers.prompt_context import (
+    build_character_block,
+    build_unmapped_speaker_block,
+    load_prompt_characters,
+    load_unmapped_gendered_speakers,
+)
 from app.jobs.registry import register_job_handler
 
 logger = logging.getLogger(__name__)
-
-def _build_character_block(characters: list[ProjectCharacter]) -> str:
-    lines = []
-    for c in characters:
-        extras = [(k, v) for k, v in [
-            ("gender", c.gender),
-            ("social_position", c.social_position),
-            ("note", c.note),
-        ] if v and v.strip()]
-        if not extras:
-            continue  # skip characters with name only
-        parts = [c.name] + [f"{k}: {v}" for k, v in extras]
-        lines.append("- " + ", ".join(parts))
-    return "\n".join(lines)
 
 
 def _build_dialogue_block(
@@ -76,10 +68,10 @@ def translate_chunk(
         # Load characters via project
         file = session.get(File, file_id)
         characters: list[ProjectCharacter] = []
+        unmapped_speakers: list[ProjectSpeaker] = []
         if file is not None:
-            characters = list(session.scalars(
-                select(ProjectCharacter).where(ProjectCharacter.project_id == file.project_id)
-            ).all())
+            characters = load_prompt_characters(session, file.project_id)
+            unmapped_speakers = load_unmapped_gendered_speakers(session, file.project_id)
 
         # Load subtitle events for target range
         target_events = list(session.scalars(
@@ -104,6 +96,7 @@ def translate_chunk(
             ).all())
 
         char_snapshot = list(characters)
+        speaker_snapshot = list(unmapped_speakers)
         ctx_snapshot = list(context_events)
         tgt_snapshot = list(target_events)
         target_ids = {e.line_index: e.id for e in target_events}
@@ -117,12 +110,15 @@ def translate_chunk(
 
     system_prompt = ctx.options.resolved_translation_prompt().strip()
 
-    char_block= _build_character_block(char_snapshot)
+    char_block = build_character_block(char_snapshot)
+    speaker_block = build_unmapped_speaker_block(speaker_snapshot)
     dialogue_block = _build_dialogue_block(ctx_snapshot, tgt_snapshot)
 
     user_parts = []
     if char_block:
         user_parts.append(f"## Characters\n{char_block}")
+    if speaker_block:
+        user_parts.append(f"## Unmapped Speakers\n{speaker_block}")
     user_parts.append(f"## Dialogue\n{dialogue_block}")
     user_message = "\n\n".join(user_parts)
 

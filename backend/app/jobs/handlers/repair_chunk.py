@@ -11,8 +11,14 @@ from openai import OpenAI
 from sqlalchemy import select
 
 from app.core.database import SyncSessionLocal
-from app.db.models import QaItem, SubtitleChunk, SubtitleEvent
+from app.db.models import File, ProjectCharacter, ProjectSpeaker, QaItem, SubtitleChunk, SubtitleEvent
 from app.jobs.context import JobContext, JobResult, ProgressFn
+from app.jobs.handlers.prompt_context import (
+    build_character_block,
+    build_unmapped_speaker_block,
+    load_prompt_characters,
+    load_unmapped_gendered_speakers,
+)
 from app.jobs.registry import register_job_handler
 
 logger = logging.getLogger(__name__)
@@ -118,6 +124,12 @@ def repair_chunk(
 
         translate_from = chunk.translate_from_line
         translate_to = chunk.translate_to_line
+        file = session.get(File, file_id)
+        characters: list[ProjectCharacter] = []
+        unmapped_speakers: list[ProjectSpeaker] = []
+        if file is not None:
+            characters = load_prompt_characters(session, file.project_id)
+            unmapped_speakers = load_unmapped_gendered_speakers(session, file.project_id)
 
         # All dialogue events in chunk range, ordered
         all_events = list(session.scalars(
@@ -158,13 +170,24 @@ def repair_chunk(
         for qa in qa_rows:
             qa_errors.setdefault(qa.subtitle_event_id, []).append(qa.qa_type)
 
+        char_snapshot = list(characters)
+        speaker_snapshot = list(unmapped_speakers)
+
     progress(0.2, f"Building repair prompt for {len(rejected_data)} rejected event(s)")
 
     system_prompt = ctx.options.resolved_repair_prompt().strip()
     system_prompt += f"\n{_REPAIR_RULES}"
 
     repair_block = _build_repair_block(rejected_data, all_events_data, qa_errors)
-    user_message = f"## Lines to Repair\n\n{repair_block}"
+    user_parts = []
+    char_block = build_character_block(char_snapshot)
+    speaker_block = build_unmapped_speaker_block(speaker_snapshot)
+    if char_block:
+        user_parts.append(f"## Characters\n{char_block}")
+    if speaker_block:
+        user_parts.append(f"## Unmapped Speakers\n{speaker_block}")
+    user_parts.append(f"## Lines to Repair\n\n{repair_block}")
+    user_message = "\n\n".join(user_parts)
 
     progress(0.4, f"Calling OpenAI ({model})")
 

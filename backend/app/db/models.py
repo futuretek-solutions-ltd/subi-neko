@@ -55,6 +55,11 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class WatchedWordType(str, Enum):
+    ORIGINAL = "original"
+    TRANSLATED = "translated"
+
+
 # ---------------------------------------------------------------------------
 # Tables
 # ---------------------------------------------------------------------------
@@ -94,7 +99,25 @@ class Project(Base):
     files: Mapped[list["File"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     characters: Mapped[list["ProjectCharacter"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     speakers: Mapped[list["ProjectSpeaker"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    watched_words: Mapped[list["ProjectWatchedWord"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     jobs: Mapped[list["JobRecord"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+
+
+class ProjectWatchedWord(Base):
+    __tablename__ = "project_watched_words"
+    __table_args__ = (
+        UniqueConstraint("project_id", "word", "word_type", name="uq_project_watched_words_project_word_type"),
+        Index("idx_project_watched_words_project_type", "project_id", "word_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    word: Mapped[str] = mapped_column(Text, nullable=False)
+    word_type: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(Text, nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(Text, nullable=False, server_default=func.now(), onupdate=func.now())
+
+    project: Mapped["Project"] = relationship(back_populates="watched_words")
 
 
 class ProjectCharacter(Base):
@@ -128,6 +151,7 @@ class ProjectSpeaker(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
+    gender: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(Text, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(Text, nullable=False, server_default=func.now(), onupdate=func.now())
 

@@ -33,6 +33,7 @@ import {
   Pause,
   Play,
   Plus,
+  Eye,
   SpinnerGap,
   Stop,
   Trash,
@@ -45,6 +46,7 @@ import { OptionsDrawer } from '../../pages/OptionsDrawer';
 import { ImportDialog } from '../../pages/ImportDialog';
 import { CharacterMappingDialog } from '../../pages/CharacterMappingDialog';
 import { SubtitleEditorDialog } from '../../pages/SubtitleEditorDialog';
+import { WatchedWordsDialog } from '../../pages/WatchedWordsDialog';
 import { ActiveJobsPanel } from '../Jobs/ActiveJobsPanel';
 import { ProjectPipeline } from '../Project/ProjectPipeline';
 import posterUrl from '../../assets/poster.png';
@@ -706,6 +708,7 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
   const resumeMutation = useResumeProject();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [mappingOpen, setMappingOpen] = useState(false);
+  const [watchedWordsOpen, setWatchedWordsOpen] = useState(false);
   const [subtitleEditorFile, setSubtitleEditorFile] = useState<VideoFile | null>(null);
   const [expandedFileIds, setExpandedFileIds] = useState<Set<number>>(() => new Set());
 
@@ -773,6 +776,12 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
         onClose={() => setMappingOpen(false)}
       />
 
+      <WatchedWordsDialog
+        projectId={project.id}
+        opened={watchedWordsOpen}
+        onClose={() => setWatchedWordsOpen(false)}
+      />
+
       <SubtitleEditorDialog
         projectId={project.id}
         file={subtitleEditorFile}
@@ -820,6 +829,15 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
               </Group>
             </Box>
             <Group gap="xs">
+              <Button
+                variant="subtle"
+                color="blue"
+                size="xs"
+                leftSection={<Eye size={14} />}
+                onClick={() => setWatchedWordsOpen(true)}
+              >
+                Watched words
+              </Button>
               {!isTerminal && (
                 <Button
                   variant="subtle"

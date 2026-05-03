@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import client from '../api/client';
-import type { Project, ProjectStats, SubtitleChunk, VideoFile } from '../types';
+import type { Project, ProjectStats, ProjectWatchedWord, SubtitleChunk, VideoFile, WatchedWordType } from '../types';
 
 export function useProjects() {
   return useQuery<Project[]>({
@@ -114,6 +114,57 @@ export function useAcceptFileReview(projectId: number) {
       );
       queryClient.invalidateQueries({ queryKey: ['projects'] });
       queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'files', data.id, 'chunks'] });
+    },
+  });
+}
+
+export function useProjectWatchedWords(projectId: number | null, enabled = true) {
+  return useQuery<ProjectWatchedWord[]>({
+    queryKey: ['projects', projectId, 'watched-words'],
+    queryFn: async () => {
+      const { data } = await client.get<ProjectWatchedWord[]>(`/projects/${projectId}/watched-words`);
+      return data;
+    },
+    enabled: enabled && projectId !== null,
+    staleTime: 30_000,
+  });
+}
+
+export function useCreateProjectWatchedWord(projectId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { word: string; word_type: WatchedWordType }) => {
+      const { data } = await client.post<ProjectWatchedWord>(`/projects/${projectId}/watched-words`, payload);
+      return data;
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData<ProjectWatchedWord[]>(
+        ['projects', projectId, 'watched-words'],
+        (words) => {
+          const next = [...(words ?? []), data];
+          return next.sort((a, b) => (
+            a.word_type === b.word_type
+              ? a.word.localeCompare(b.word)
+              : a.word_type.localeCompare(b.word_type)
+          ));
+        },
+      );
+    },
+  });
+}
+
+export function useDeleteProjectWatchedWord(projectId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (watchedWordId: number) => {
+      await client.delete(`/projects/${projectId}/watched-words/${watchedWordId}`);
+      return watchedWordId;
+    },
+    onSuccess: (watchedWordId) => {
+      queryClient.setQueryData<ProjectWatchedWord[]>(
+        ['projects', projectId, 'watched-words'],
+        (words) => words?.filter((word) => word.id !== watchedWordId),
+      );
     },
   });
 }

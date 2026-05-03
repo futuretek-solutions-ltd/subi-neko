@@ -84,6 +84,17 @@ export interface ChunkJob {
   updated_at: string;
 }
 
+export type WatchedWordType = 'original' | 'translated';
+
+export interface ProjectWatchedWord {
+  id: number;
+  project_id: number;
+  word: string;
+  word_type: WatchedWordType;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface VideoFile {
   id: number;
   project_id: number;
@@ -124,6 +135,7 @@ export interface SubtitleEventEditorRow {
   translated_text: string | null;
   original_ai_translated_text: string | null;
   speaker_name: string | null;
+  speaker_gender: string | null;
   character_name: string | null;
   character_gender: string | null;
   is_user_edited: boolean;
@@ -160,6 +172,7 @@ export interface ProjectSpeaker {
   id: number;
   project_id: number;
   name: string;
+  gender: string | null;
   created_at: string;
   updated_at: string;
 }

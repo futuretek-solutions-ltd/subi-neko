@@ -29,9 +29,12 @@ import app.jobs.handlers.translate_chunk          # noqa: F401
 import app.jobs.handlers.validate_chunk           # noqa: F401
 import app.jobs.handlers.resolve_style_fonts      # noqa: F401
 import app.jobs.handlers.repair_chunk             # noqa: F401
-import app.jobs.handlers.review_chunk_rules       # noqa: F401
-import app.jobs.handlers.review_chunk_grammar     # noqa: F401
-import app.jobs.handlers.review_chunk_llm          # noqa: F401
+import app.jobs.handlers.polish_chunk             # noqa: F401
+import app.jobs.handlers.review_chunk_final       # noqa: F401
+import app.jobs.handlers.analyze_script           # noqa: F401
+import app.jobs.handlers.style_bible              # noqa: F401
+import app.jobs.handlers.infer_character_mapping  # noqa: F401
+import app.jobs.handlers.compute_file_metrics     # noqa: F401
 
 APP_NAME = "subi-neko"
 

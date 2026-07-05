@@ -29,7 +29,9 @@ interface SubtitleDraft {
 
 type DraftMap = Record<number, SubtitleDraft>;
 
+// One severity scale: blocker | warning | info (legacy names tolerated).
 const SEVERITY_COLORS: Record<string, string> = {
+  blocker: 'red',
   critical: 'red',
   error: 'red',
   high: 'red',
@@ -40,13 +42,14 @@ const SEVERITY_COLORS: Record<string, string> = {
 };
 
 const SEVERITY_RANK: Record<string, number> = {
+  blocker: 0,
   critical: 0,
-  error: 1,
-  high: 1,
-  warning: 2,
-  medium: 2,
-  info: 3,
-  low: 3,
+  error: 0,
+  high: 0,
+  warning: 1,
+  medium: 1,
+  info: 2,
+  low: 2,
 };
 
 const GENDER_COLORS: Record<string, string> = {
@@ -64,10 +67,20 @@ const NON_BINARY_BADGE_STYLE = {
 
 function sortIssues(issues: QaIssue[]) {
   return [...issues].sort((a, b) => {
+    if (a.is_resolved !== b.is_resolved) return a.is_resolved ? 1 : -1;
     const ar = SEVERITY_RANK[a.severity.toLowerCase()] ?? 99;
     const br = SEVERITY_RANK[b.severity.toLowerCase()] ?? 99;
     if (ar !== br) return ar - br;
     return a.id - b.id;
+  });
+}
+
+// Blockers are always shown; warnings/info and resolved issues are togglable.
+function filterIssues(issues: QaIssue[], showWarnings: boolean, showResolved: boolean) {
+  return issues.filter((issue) => {
+    if (!showResolved && issue.is_resolved) return false;
+    if (!showWarnings && (SEVERITY_RANK[issue.severity.toLowerCase()] ?? 99) > 0) return false;
+    return true;
   });
 }
 
@@ -146,6 +159,7 @@ function IssueRow({
         border: '1px solid var(--mantine-color-dark-5)',
         borderRadius: 6,
         backgroundColor: 'var(--mantine-color-dark-7)',
+        opacity: issue.is_resolved ? 0.55 : 1,
       }}
     >
       <Badge size="xs" color={color} variant="light" style={{ width: 64, flexShrink: 0 }}>
@@ -161,19 +175,31 @@ function IssueRow({
           {issue.message}
         </Text>
       </Box>
-      <Tooltip label="Resolve issue" withArrow>
-        <Button
-          size="compact-xs"
-          variant="subtle"
+      {issue.is_resolved ? (
+        <Badge
+          size="xs"
           color="green"
-          loading={resolving}
-          leftSection={<CheckCircle size={13} />}
-          onClick={() => onResolve(issue.id)}
+          variant="outline"
+          title={issue.resolution_note ? `Resolved: ${issue.resolution_note}` : 'Resolved'}
           style={{ flexShrink: 0 }}
         >
-          Solve
-        </Button>
-      </Tooltip>
+          resolved
+        </Badge>
+      ) : (
+        <Tooltip label="Resolve issue" withArrow>
+          <Button
+            size="compact-xs"
+            variant="subtle"
+            color="green"
+            loading={resolving}
+            leftSection={<CheckCircle size={13} />}
+            onClick={() => onResolve(issue.id)}
+            style={{ flexShrink: 0 }}
+          >
+            Solve
+          </Button>
+        </Tooltip>
+      )}
     </Group>
   );
 }
@@ -184,6 +210,8 @@ const SubtitleRow = memo(function SubtitleRow({
   resolvingIssueId,
   saving,
   reverting,
+  showInfo,
+  showResolved,
   onChange,
   onBlurSave,
   onRevert,
@@ -198,12 +226,14 @@ const SubtitleRow = memo(function SubtitleRow({
   resolvingIssueId: number | null;
   saving: boolean;
   reverting: boolean;
+  showInfo: boolean;
+  showResolved: boolean;
   onChange: (eventId: number, translatedText: string) => void;
   onBlurSave: (row: SubtitleEventEditorRow) => void;
   onRevert: (row: SubtitleEventEditorRow) => void;
   onResolve: (issueId: number) => void;
 }) {
-  const issues = sortIssues(row.issues);
+  const issues = sortIssues(filterIssues(row.issues, showInfo, showResolved));
   const canRevert = row.original_ai_translated_text !== null
     && draft.translated_text !== row.original_ai_translated_text;
   const watchedMatches = useMemo<WatchedWordMatches>(() => ({
@@ -301,6 +331,8 @@ const SubtitleRow = memo(function SubtitleRow({
   && prev.translatedWatchedWords === next.translatedWatchedWords
   && prev.saving === next.saving
   && prev.reverting === next.reverting
+  && prev.showInfo === next.showInfo
+  && prev.showResolved === next.showResolved
   && !prev.row.issues.some((issue) => issue.id === prev.resolvingIssueId || issue.id === next.resolvingIssueId)
 ));
 
@@ -323,6 +355,8 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
   const [savingEventId, setSavingEventId] = useState<number | null>(null);
   const [revertingEventId, setRevertingEventId] = useState<number | null>(null);
   const [issuesOnly, setIssuesOnly] = useState(false);
+  const [showInfo, setShowInfo] = useState(true);
+  const [showResolved, setShowResolved] = useState(false);
 
   useEffect(() => {
     if (!opened) return;
@@ -347,7 +381,7 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
   const issueSummary = useMemo(() => {
     const counts = new Map<string, { qa_type: string; severity: string; count: number }>();
     for (const row of rows) {
-      for (const issue of row.issues) {
+      for (const issue of filterIssues(row.issues, showInfo, showResolved)) {
         const key = `${issue.severity}:${issue.qa_type}`;
         const existing = counts.get(key);
         if (existing) {
@@ -363,11 +397,16 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
       if (ar !== br) return ar - br;
       return b.count - a.count;
     });
-  }, [rows]);
-  const issueCount = issueSummary.reduce((sum, item) => sum + item.count, 0);
+  }, [rows, showInfo, showResolved]);
+  const unresolvedCount = useMemo(
+    () => rows.reduce((sum, row) => sum + row.issues.filter((issue) => !issue.is_resolved).length, 0),
+    [rows],
+  );
   const visibleRows = useMemo(
-    () => (issuesOnly ? rows.filter((row) => row.issues.length > 0) : rows),
-    [issuesOnly, rows],
+    () => (issuesOnly
+      ? rows.filter((row) => filterIssues(row.issues, showInfo, showResolved).length > 0)
+      : rows),
+    [issuesOnly, rows, showInfo, showResolved],
   );
   const watchedWordsByType = useMemo(() => ({
     original: watchedWords.filter((word) => word.word_type === 'original'),
@@ -458,6 +497,8 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
   function handleClose() {
     setDrafts({});
     setIssuesOnly(false);
+    setShowInfo(true);
+    setShowResolved(false);
     onClose();
   }
 
@@ -471,7 +512,7 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
           <Text fw={600}>Subtitle Editor</Text>
           {file && <Text size="sm" c="dimmed">{file.filename}</Text>}
           {dirtyCount > 0 && <Badge size="sm" color="orange" variant="light">{dirtyCount} unsaved</Badge>}
-          {issueCount > 0 && <Badge size="sm" color="red" variant="light">{issueCount} issues</Badge>}
+          {unresolvedCount > 0 && <Badge size="sm" color="red" variant="light">{unresolvedCount} issues</Badge>}
         </Group>
       }
       size="95%"
@@ -514,12 +555,26 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
                 </Group>
               )}
             </Group>
-            <Checkbox
-              size="xs"
-              checked={issuesOnly}
-              label="Show only events with issues"
-              onChange={(e) => setIssuesOnly(e.currentTarget.checked)}
-            />
+            <Group gap="md" wrap="nowrap" style={{ flexShrink: 0 }}>
+              <Checkbox
+                size="xs"
+                checked={showInfo}
+                label="Info"
+                onChange={(e) => setShowInfo(e.currentTarget.checked)}
+              />
+              <Checkbox
+                size="xs"
+                checked={showResolved}
+                label="Resolved issues"
+                onChange={(e) => setShowResolved(e.currentTarget.checked)}
+              />
+              <Checkbox
+                size="xs"
+                checked={issuesOnly}
+                label="Show only events with issues"
+                onChange={(e) => setIssuesOnly(e.currentTarget.checked)}
+              />
+            </Group>
           </Group>
 
           {visibleRows.length === 0 ? (
@@ -549,6 +604,8 @@ export function SubtitleEditorDialog({ projectId, file, opened, onClose }: Subti
                         resolvingIssueId={resolvingIssueId}
                         saving={savingEventId === row.id}
                         reverting={revertingEventId === row.id}
+                        showInfo={showInfo}
+                        showResolved={showResolved}
                         onChange={handleDraftChange}
                         onBlurSave={handleBlurSave}
                         onRevert={handleRevert}

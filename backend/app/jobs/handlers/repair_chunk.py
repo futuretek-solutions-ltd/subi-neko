@@ -1,48 +1,42 @@
 from __future__ import annotations
 
-import json
 import logging
 
-from app.jobs.handlers.utils import sanitize_llm_json
 from datetime import datetime
 from typing import Any
 
-from openai import OpenAI
 from sqlalchemy import select
 
 from app.core.database import SyncSessionLocal
 from app.db.models import File, ProjectCharacter, ProjectSpeaker, QaItem, SubtitleChunk, SubtitleEvent
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.handlers.prompt_context import (
+    StyleContext,
     build_character_block,
+    build_glossary_block,
+    build_style_block,
+    build_speaker_identity_map,
     build_unmapped_speaker_block,
+    load_glossary_terms,
     load_prompt_characters,
+    load_style_context,
     load_unmapped_gendered_speakers,
 )
 from app.jobs.registry import register_job_handler
+from app.llm import client as llm_client
+from app.llm.schemas import RepairResponse
+from app.subs.tag_masking import MaskedLine, force_unmask, mask_line, plain_text, unmask_line
 
 logger = logging.getLogger(__name__)
 
 _CONTEXT_WINDOW = 2  # lines before and after each failed line
-
-_REPAIR_RULES = """
-Structural rules (never break):
-- Preserve ALL ASS inline tags exactly: {\\an8}, {\\i1}, {\\pos(x,y)}, etc.
-- { and } counts must match the source line exactly
-- Preserve \\N, \\n, \\h escapes exactly as in source
-- No prefixes, numbering, bullets, markdown, or meta-commentary
-- Output subtitle text only
-
-Return a single JSON object:
-{"repairs": [{"i": <line_index>, "t": "<fixed translation>"}]}
-Include exactly one entry per FAILED line. Do NOT include CONTEXT lines.
-"""
 
 
 def _build_repair_block(
     rejected: list[dict],
     all_events_by_pos: list[dict],
     qa_errors: dict[int, list[str]],
+    masked: dict[int, MaskedLine],
 ) -> str:
     """
     Build the user message block for repair.
@@ -50,6 +44,7 @@ def _build_repair_block(
     rejected: list of event dicts (line_index, source_text, translated_text, id)
     all_events_by_pos: all dialogue events in chunk, sorted by line_index, as dicts
     qa_errors: event_id → list of qa_type strings
+    masked: line_index → MaskedLine of the source text
     """
     pos_map = {e["line_index"]: i for i, e in enumerate(all_events_by_pos)}
     total = len(all_events_by_pos)
@@ -62,9 +57,9 @@ def _build_repair_block(
 
         lines = []
         lines.append(f"### FAILED line {li} — errors: {', '.join(errors) if errors else 'unknown'}")
-        lines.append(f"  source: {ev['source_text']}")
+        lines.append(f"  source: {masked[li].text}")
         if ev["translated_text"]:
-            lines.append(f"  faulty: {ev['translated_text']}")
+            lines.append(f"  faulty: {plain_text(ev['translated_text'])}")
 
         # context before
         ctx_before = []
@@ -72,7 +67,7 @@ def _build_repair_block(
             for i in range(max(0, pos - _CONTEXT_WINDOW), pos):
                 ctx_ev = all_events_by_pos[i]
                 text = ctx_ev["translated_text"] or ctx_ev["source_text"]
-                ctx_before.append(f"  [CONTEXT {ctx_ev['line_index']}]: {text}")
+                ctx_before.append(f"  [CONTEXT {ctx_ev['line_index']}]: {plain_text(text)}")
         if ctx_before:
             lines.append("Context before:")
             lines.extend(ctx_before)
@@ -83,7 +78,7 @@ def _build_repair_block(
             for i in range(pos + 1, min(total, pos + 1 + _CONTEXT_WINDOW)):
                 ctx_ev = all_events_by_pos[i]
                 text = ctx_ev["translated_text"] or ctx_ev["source_text"]
-                ctx_after.append(f"  [CONTEXT {ctx_ev['line_index']}]: {text}")
+                ctx_after.append(f"  [CONTEXT {ctx_ev['line_index']}]: {plain_text(text)}")
         if ctx_after:
             lines.append("Context after:")
             lines.extend(ctx_after)
@@ -101,7 +96,7 @@ def repair_chunk(
 ) -> JobResult:
     file_id: int = payload["file_id"]
     chunk_index: int = payload["chunk_index"]
-    model: str = payload.get("model") or ctx.options.openai_model_better or ctx.options.openai_model_cheap or "gpt-4o"
+    model: str = payload.get("model") or ctx.options.openai_model_better or ctx.options.openai_model_cheap
     now = datetime.utcnow().isoformat()
 
     if not ctx.options.openai_api_key and not ctx.options.openai_api_base:
@@ -124,20 +119,31 @@ def repair_chunk(
 
         translate_from = chunk.translate_from_line
         translate_to = chunk.translate_to_line
+        chunk_id = chunk.id
+        content_type = chunk.content_type or "dialogue"
         file = session.get(File, file_id)
+        project_id = file.project_id if file is not None else None
         characters: list[ProjectCharacter] = []
         unmapped_speakers: list[ProjectSpeaker] = []
-        if file is not None:
+        identities: dict[str, tuple[str | None, str | None]] = {}
+        style: StyleContext | None = None
+        if file is not None and content_type == "dialogue":
             characters = load_prompt_characters(session, file.project_id)
             unmapped_speakers = load_unmapped_gendered_speakers(session, file.project_id)
+            identities = build_speaker_identity_map(session, file.project_id)
+            style = load_style_context(session, file.project_id)
 
-        # All dialogue events in chunk range, ordered
+        glossary_terms = load_glossary_terms(session, project_id) if project_id else []
+
+        # All events in chunk range, ordered (scoped to this chunk's own
+        # content_type partition — partitions can interleave in line_index space)
         all_events = list(session.scalars(
             select(SubtitleEvent)
             .where(SubtitleEvent.file_id == file_id)
             .where(SubtitleEvent.line_index >= translate_from)
             .where(SubtitleEvent.line_index <= translate_to)
             .where(SubtitleEvent.event_type == "dialogue")
+            .where(SubtitleEvent.content_type == content_type)
             .order_by(SubtitleEvent.line_index)
         ).all())
 
@@ -145,6 +151,7 @@ def repair_chunk(
             {
                 "id": e.id,
                 "line_index": e.line_index,
+                "name": e.name,
                 "source_text": e.source_text,
                 "translated_text": e.translated_text,
                 "translation_status": e.translation_status,
@@ -176,9 +183,12 @@ def repair_chunk(
     progress(0.2, f"Building repair prompt for {len(rejected_data)} rejected event(s)")
 
     system_prompt = ctx.options.resolved_repair_prompt().strip()
-    system_prompt += f"\n{_REPAIR_RULES}"
 
-    repair_block = _build_repair_block(rejected_data, all_events_data, qa_errors)
+    masked: dict[int, MaskedLine] = {
+        e["line_index"]: mask_line(e["source_text"]) for e in rejected_data
+    }
+
+    repair_block = _build_repair_block(rejected_data, all_events_data, qa_errors, masked)
     user_parts = []
     char_block = build_character_block(char_snapshot)
     speaker_block = build_unmapped_speaker_block(speaker_snapshot)
@@ -186,52 +196,59 @@ def repair_chunk(
         user_parts.append(f"## Characters\n{char_block}")
     if speaker_block:
         user_parts.append(f"## Unmapped Speakers\n{speaker_block}")
+    if style is not None and style.has_content:
+        speakers_present = {e["name"] for e in rejected_data if e.get("name")}
+        style_block = build_style_block(style, speakers_present, identities)
+        if style_block:
+            user_parts.append(f"## Style\n{style_block}")
+    glossary_block = build_glossary_block(
+        glossary_terms, [e["source_text"] for e in rejected_data])
+    if glossary_block:
+        user_parts.append(
+            "## Glossary\nEstablished translations — follow them exactly, "
+            f"including vocative forms:\n{glossary_block}")
     user_parts.append(f"## Lines to Repair\n\n{repair_block}")
     user_message = "\n\n".join(user_parts)
 
-    progress(0.4, f"Calling OpenAI ({model})")
+    progress(0.4, f"Calling LLM ({model})")
 
-    client = OpenAI(
-        api_key=ctx.options.openai_api_key or "no-key",
-        base_url=ctx.options.openai_api_base or None,
-    )
+    source_chars = sum(len(m.text) for m in masked.values())
+    max_completion_tokens = llm_client.completion_budget(source_chars, len(rejected_data))
 
     try:
-        response = client.chat.completions.create(
+        response, stats = llm_client.complete(
+            task="repair",
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
+            system=system_prompt,
+            user=user_message,
+            schema=RepairResponse,
+            options=ctx.options,
+            max_completion_tokens=max_completion_tokens,
+            project_id=project_id,
+            file_id=file_id,
+            chunk_id=chunk_id,
         )
-    except Exception as exc:
+    except llm_client.LlmError as exc:
         return JobResult(status="failed", result=None,
-                         error_code="OPENAI_API_ERROR",
-                         error_message=str(exc))
+                         error_code=exc.code, error_message=exc.message)
 
-    raw_content = response.choices[0].message.content or ""
+    progress(0.7, "Unmasking and verifying markup")
 
-    progress(0.7, "Parsing response")
-
-    try:
-        parsed = json.loads(sanitize_llm_json(raw_content))
-        repairs: list[dict] = parsed["repairs"]
-    except Exception as exc:
-        return JobResult(status="failed", result=None,
-                         error_code="RESPONSE_PARSE_ERROR",
-                         error_message=f"Could not parse model response: {exc}\n\nRaw: {raw_content[:500]}")
-
+    rejected_by_line: dict[int, int] = {e["line_index"]: e["id"] for e in rejected_data}
     repair_map: dict[int, str] = {}
-    for entry in repairs:
-        try:
-            repair_map[int(entry["i"])] = str(entry["t"])
-        except (KeyError, ValueError, TypeError):
+    for item in response.repairs:
+        if item.i not in rejected_by_line:
             continue
+        final_text, errors = unmask_line(item.t, masked[item.i])
+        if errors:
+            logger.info("Repair marker verification failed for line %d: %s — best-effort assembly",
+                        item.i, errors)
+            final_text = force_unmask(item.t, masked[item.i])
+        repair_map[item.i] = final_text
 
     progress(0.85, "Writing repaired translations")
 
     repaired_count = 0
-    rejected_by_line: dict[int, int] = {e["line_index"]: e["id"] for e in rejected_data}
 
     with SyncSessionLocal() as session:
         for line_index, event_id in rejected_by_line.items():
@@ -271,7 +288,10 @@ def repair_chunk(
     progress(1.0, "Done")
     return JobResult(
         status="succeeded",
-        result={"repaired_events": repaired_count},
+        result={
+            "repaired_events": repaired_count,
+            "response_mode": stats.response_mode,
+        },
         error_code=None,
         error_message=None,
     )

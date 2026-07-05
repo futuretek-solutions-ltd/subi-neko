@@ -34,6 +34,7 @@ class SearchResult:
     title_native: str | None = None
     year: int | None = None
     media_type: MediaType = MediaType.UNKNOWN
+    episode_count: int | None = None
 
 
 @dataclass
@@ -56,11 +57,22 @@ class Character:
     role: CharacterRole | None = None
     gender: CharacterGender | None = None
     description: str | None = None
+    voice_actor: str | None = None
+    character_type: str | None = None
+
+
+@dataclass
+class Episode:
+    number: int
+    title: str | None = None
+    title_native: str | None = None
+    air_date: str | None = None
 
 
 class MetadataProvider(ABC):
     supports_search: bool = True
     supports_characters: bool = True
+    supports_episodes: bool = False
 
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = config or {}
@@ -73,3 +85,8 @@ class MetadataProvider(ABC):
 
     @abstractmethod
     async def get_characters(self, provider_id: str) -> list[Character]: ...
+
+    async def get_episodes(self, provider_id: str) -> list[Episode]:
+        """Per-episode metadata (titles, air dates). Optional — providers
+        without episode data return an empty list."""
+        return []

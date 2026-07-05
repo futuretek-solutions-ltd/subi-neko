@@ -21,6 +21,14 @@ export function useSaveOptions() {
       await client.patch('/options', patch);
     },
     onSuccess: (_data, patch) => {
+      // Setting a key to null means "revert to the built-in default", whose
+      // value only the server knows — refetch instead of caching the null
+      // (which left prompt fields empty until a manual refresh).
+      const hasReset = Object.values(patch).some((value) => value === null);
+      if (hasReset) {
+        queryClient.invalidateQueries({ queryKey: ['options'] });
+        return;
+      }
       queryClient.setQueryData<OptionsMap>(['options'], (prev) =>
         prev ? { ...prev, ...patch } : patch
       );

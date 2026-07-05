@@ -18,4 +18,10 @@ def _load(filename: str) -> str:
 
 DEFAULT_TRANSLATION_PROMPT: str = _load("translate.txt")
 DEFAULT_REPAIR_PROMPT: str = _load("repair.txt")
-DEFAULT_LLM_REVIEW_PROMPT: str = _load("review.txt")
+DEFAULT_POLISH_PROMPT: str = _load("polish.txt")
+DEFAULT_SIGN_TRANSLATION_PROMPT: str = _load("sign.txt")
+DEFAULT_SONG_TRANSLATION_PROMPT: str = _load("song.txt")
+DEFAULT_ANALYZE_PROMPT: str = _load("analyze.txt")
+DEFAULT_MAPPING_PROMPT: str = _load("mapping.txt")
+DEFAULT_STYLE_BIBLE_PROMPT: str = _load("style_bible.txt")
+DEFAULT_STYLE_BIBLE_UPDATE_PROMPT: str = _load("style_bible_update.txt")

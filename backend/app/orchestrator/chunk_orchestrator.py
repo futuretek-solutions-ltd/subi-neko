@@ -1,29 +1,48 @@
-"""Chunk-level orchestrator — drives the sequential translation pipeline."""
+"""Chunk-level orchestrator — drives the sequential translation pipeline.
+
+Chunk state machine:
+
+    pending               → translate_chunk   (gated: previous chunk must
+                                               have started translating)
+    translated            → validate_chunk
+    validate_trans_failed → repair_chunk      (one attempt, then terminal)
+    validated             → polish_chunk      (full-coverage quality pass)
+    polished              → review_chunk_final
+    needs_polish          → polish_chunk      (targeted re-pass, max 1)
+    final_reviewed        → complete          (auto)
+
+Terminal: job_failed, validate_repair_failed (require user action).
+
+Translation is serialized per file (chunk N waits until chunk N-1 left
+"pending") so each chunk can see its predecessors' finished translations as
+context. Later stages are not gated — polish of chunk N runs while chunk
+N+1 translates.
+"""
 from __future__ import annotations
 
 import logging
 from datetime import datetime
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.database import AsyncSessionLocal
 from app.db import options as options_store
-from app.db.models import SubtitleChunk
+from app.db.models import SubtitleChunk, SubtitleEvent
 
 logger = logging.getLogger(__name__)
 
 EnqueueFn = Callable[..., Awaitable[Any]]
 
-# Chunk status → (job_type, needs_enqueue)
-# If needs_enqueue is False, orchestrator handles the transition directly.
-_CHUNK_TRANSITIONS: dict[str, tuple[str, bool]] = {
-    "pending":                ("translate_chunk",            True),
-    "translated":             ("validate_chunk",             True),
-    "validate_trans_failed":  ("repair_chunk",               True),
-    "validated":              ("review_chunk_rules",         True),
-    "rules_reviewed":         ("review_chunk_grammar",       True),
-    # grammar_reviewed and llm_reviewed handled with custom logic
+# Chunk status → next job type.
+_CHUNK_TRANSITIONS: dict[str, str] = {
+    "pending":                "translate_chunk",
+    "translated":             "validate_chunk",
+    "validate_trans_failed":  "repair_chunk",
+    "validated":              "polish_chunk",
+    "polished":               "review_chunk_final",
+    "needs_polish":           "polish_chunk",
+    # final_reviewed handled with custom logic (auto-complete)
 }
 
 # Terminal statuses that require user action — orchestrator must not enqueue anything.
@@ -53,56 +72,71 @@ async def orchestrate_chunks(
     if not chunks:
         return False  # no chunks planned yet
 
-    llm_review_always = (await options_store.aget("LLM_REVIEW_ALWAYS", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+    translate_karaoke: bool | None = None  # read lazily, only when needed
 
     any_auto_completed = False
     has_pending_work = False
     has_blocked = False
+    previous_status: str | None = None  # status of chunk_index - 1 after this pass
 
     for chunk in chunks:
-        if chunk.status == "complete":
+        status = chunk.status
+
+        if status == "complete":
+            previous_status = status
             continue
 
         # --- Terminal statuses: require user action, stop processing ---
-        if chunk.status in CHUNK_TERMINAL_STATUSES:
+        if status in CHUNK_TERMINAL_STATUSES:
             has_blocked = True
+            previous_status = status
             continue
 
-        # --- grammar_reviewed: conditional LLM or auto-complete ---
-        if chunk.status in {"grammar_reviewed", "languagetool_reviewed"}:
-            if llm_review_always or chunk.llm_review_needed:
-                await _ensure_chunk_job(
-                    enqueue_fn, "review_chunk_llm",
-                    file_id, project_id, chunk.chunk_index,
+        # --- Karaoke skip: keep original \k-timed lines untouched ---
+        if status == "pending" and chunk.content_type == "karaoke":
+            if translate_karaoke is None:
+                translate_karaoke = (
+                    (await options_store.aget("TRANSLATE_KARAOKE", "0") or "").strip().lower()
+                    in ("1", "true", "yes", "on")
                 )
-                has_pending_work = True
-            else:
-                await _set_chunk_complete(file_id, chunk.chunk_index)
+            if not translate_karaoke:
+                await _skip_karaoke_chunk(file_id, chunk)
                 any_auto_completed = True
-            continue
+                previous_status = "complete"
+                continue
 
-        # --- llm_reviewed: auto-complete ---
-        if chunk.status == "llm_reviewed":
+        # --- final_reviewed: auto-complete ---
+        if status == "final_reviewed":
             await _set_chunk_complete(file_id, chunk.chunk_index)
             any_auto_completed = True
+            previous_status = "complete"
             continue
 
         has_pending_work = True
 
-        # --- Standard transitions ---
-        transition = _CHUNK_TRANSITIONS.get(chunk.status)
-        if transition is None:
-            logger.warning(
-                "Chunk file_id=%d index=%d has unknown status '%s'",
-                file_id, chunk.chunk_index, chunk.status,
-            )
+        # --- Sequential translate gating: chunk N translates only after
+        # chunk N-1 has at least started producing translations, so the
+        # rolling context window is populated. A terminal/failed predecessor
+        # does not block (its context is simply missing). ---
+        if status == "pending" and previous_status == "pending":
+            previous_status = status
             continue
 
-        job_type, _ = transition
+        # --- Standard transitions ---
+        job_type = _CHUNK_TRANSITIONS.get(status)
+        if job_type is None:
+            logger.warning(
+                "Chunk file_id=%d index=%d has unknown status '%s'",
+                file_id, chunk.chunk_index, status,
+            )
+            previous_status = status
+            continue
+
         await _ensure_chunk_job(
             enqueue_fn, job_type,
             file_id, project_id, chunk.chunk_index,
         )
+        previous_status = status
 
     # Blocked chunks take priority when nothing else is progressing.
     # If there's still pending work alongside blocked chunks, keep the file
@@ -128,10 +162,7 @@ async def _ensure_chunk_job(
     project_id: int,
     chunk_index: int,
 ) -> None:
-    if job_type == "review_chunk_grammar":
-        dedupe_key = f"review_chunk_grammar:file:{file_id}:chunk:{chunk_index}"
-    else:
-        dedupe_key = f"{job_type}:{file_id}:{chunk_index}"
+    dedupe_key = f"{job_type}:{file_id}:{chunk_index}"
     await enqueue_fn(
         job_type=job_type,
         project_id=project_id,
@@ -157,3 +188,34 @@ async def _set_chunk_complete(file_id: int, chunk_index: int) -> None:
                 "Chunk file_id=%d index=%d → complete (orchestrator)",
                 file_id, chunk_index,
             )
+
+
+async def _skip_karaoke_chunk(file_id: int, chunk: SubtitleChunk) -> None:
+    """TRANSLATE_KARAOKE is off: keep the original karaoke lines (with their
+    per-syllable \\k timing intact) and complete the chunk without any LLM
+    work. Rendering falls back to source_text when translated_text is NULL."""
+    now = datetime.utcnow().isoformat()
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(SubtitleEvent)
+            .where(SubtitleEvent.file_id == file_id)
+            .where(SubtitleEvent.event_type == "dialogue")
+            .where(SubtitleEvent.content_type == "karaoke")
+            .where(SubtitleEvent.line_index >= chunk.translate_from_line)
+            .where(SubtitleEvent.line_index <= chunk.translate_to_line)
+            .values(translation_status="skipped", updated_at=now)
+        )
+        fresh = await session.scalar(
+            select(SubtitleChunk)
+            .where(SubtitleChunk.file_id == file_id)
+            .where(SubtitleChunk.chunk_index == chunk.chunk_index)
+        )
+        if fresh is not None and fresh.status == "pending":
+            fresh.status = "complete"
+            fresh.updated_at = now
+        await session.commit()
+    logger.info(
+        "Chunk file_id=%d index=%d (karaoke) → complete without translation "
+        "(TRANSLATE_KARAOKE off)",
+        file_id, chunk.chunk_index,
+    )

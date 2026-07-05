@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -11,7 +12,9 @@ from sqlalchemy import delete, select
 from app.core.database import SyncSessionLocal
 from app.db.models import File, QaItem, SubtitleChunk, SubtitleEvent
 from app.jobs.context import JobContext, JobResult, ProgressFn
+from app.jobs.handlers.translate_chunk import FRAGMENT_QA_TYPE
 from app.jobs.registry import register_job_handler
+from app.subs.tag_masking import plain_text
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,10 @@ _LEADING_ASS_OVERRIDE_BLOCKS = re.compile(r"^\s*(?:\{\\[^}]*\}\s*)+")
 # ---------------------------------------------------------------------------
 
 def _check_missing_translation(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
+    if not plain_text(event.source_text or ""):
+        # Nothing translatable in the source (empty or markup-only line) —
+        # an empty translation is the correct outcome, not an error.
+        return []
     if event.translated_text is None or not event.translated_text.strip():
         return [("missing_translation", "Translated text is empty.", {})]
     return []
@@ -60,6 +67,10 @@ def _ass_override_blocks(text: str) -> tuple[list[str], bool]:
 
 
 def _check_formatting_tag_mismatch(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
+    """Every override block from the source must survive verbatim in the
+    translation. Order is NOT enforced: tag masking reinserts blocks where
+    the model placed their markers, so an inline tag legitimately moves with
+    the word it wraps."""
     src = event.source_text or ""
     tgt = event.translated_text or ""
 
@@ -69,7 +80,7 @@ def _check_formatting_tag_mismatch(event: SubtitleEvent) -> list[tuple[str, str,
     details: dict[str, Any] = {}
     failed = False
 
-    if src_blocks != tgt_blocks:
+    if Counter(src_blocks) != Counter(tgt_blocks):
         details["source_blocks"] = src_blocks
         details["translated_blocks"] = tgt_blocks
         failed = True
@@ -80,6 +91,55 @@ def _check_formatting_tag_mismatch(event: SubtitleEvent) -> list[tuple[str, str,
         if tgt_malformed:
             details["translated_unclosed_override_block"] = True
         details["unclosed_block"] = True
+        failed = True
+
+    if failed:
+        return [("formatting_tag_mismatch",
+                 "ASS formatting tags are missing or malformed.",
+                 details)]
+    return []
+
+
+_TAG_NAME_RE = re.compile(r"\\([A-Za-z]+)")
+
+
+def _tag_name_multiset(text: str) -> Counter:
+    """Count ASS override tag names (ignoring numeric params and order)."""
+    blocks, _ = _ass_override_blocks(text)
+    names: list[str] = []
+    for block in blocks:
+        names.extend(_TAG_NAME_RE.findall(block))
+    return Counter(names)
+
+
+def _check_formatting_tag_mismatch_relaxed(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
+    """Like _check_formatting_tag_mismatch but tolerant of reordering/regrouping
+    of tags — used for sign/song content, where reflowing on-screen or lyric
+    text can legitimately change tag block boundaries without changing meaning.
+    Still requires the same multiset of tag names and catches unclosed blocks.
+    """
+    src = event.source_text or ""
+    tgt = event.translated_text or ""
+
+    _, src_malformed = _ass_override_blocks(src)
+    _, tgt_malformed = _ass_override_blocks(tgt)
+
+    details: dict[str, Any] = {}
+    failed = False
+
+    if src_malformed or tgt_malformed:
+        if src_malformed:
+            details["source_unclosed_override_block"] = True
+        if tgt_malformed:
+            details["translated_unclosed_override_block"] = True
+        details["unclosed_block"] = True
+        failed = True
+
+    src_multiset = _tag_name_multiset(src)
+    tgt_multiset = _tag_name_multiset(tgt)
+    if src_multiset != tgt_multiset:
+        details["source_tag_counts"] = dict(src_multiset)
+        details["translated_tag_counts"] = dict(tgt_multiset)
         failed = True
 
     if failed:
@@ -164,6 +224,35 @@ _CHECKS = [
     _check_text_corruption,
 ]
 
+# sign/song: on-screen or lyric text can legitimately reflow tag blocks when
+# translated, so tag-order/grouping is not enforced — only that the same set
+# of tag names survives (see _check_formatting_tag_mismatch_relaxed).
+_CHECKS_RELAXED_TAGS = [
+    _check_missing_translation,
+    _check_formatting_tag_mismatch_relaxed,
+    _check_escape_mismatch,
+    _check_locked_line_modified,
+    _check_text_corruption,
+]
+
+# karaoke: per-syllable \k timing tags cannot be preserved 1:1 across a
+# translation (target language syllable structure differs) — this is
+# expected, not a translation error, so the tag check is skipped entirely.
+_CHECKS_NO_TAG_CHECK = [
+    _check_missing_translation,
+    _check_escape_mismatch,
+    _check_locked_line_modified,
+    _check_text_corruption,
+]
+
+
+def _checks_for_content_type(content_type: str) -> list:
+    if content_type == "karaoke":
+        return _CHECKS_NO_TAG_CHECK
+    if content_type in ("sign", "song"):
+        return _CHECKS_RELAXED_TAGS
+    return _CHECKS
+
 
 # ---------------------------------------------------------------------------
 # Handler
@@ -194,6 +283,7 @@ def validate_chunk(
 
         translate_from = chunk.translate_from_line
         translate_to = chunk.translate_to_line
+        content_type = chunk.content_type or "dialogue"
 
         target_events: list[SubtitleEvent] = list(session.scalars(
             select(SubtitleEvent)
@@ -201,6 +291,7 @@ def validate_chunk(
             .where(SubtitleEvent.line_index >= translate_from)
             .where(SubtitleEvent.line_index <= translate_to)
             .where(SubtitleEvent.event_type == "dialogue")
+            .where(SubtitleEvent.content_type == content_type)
             .order_by(SubtitleEvent.line_index)
         ).all())
 
@@ -226,6 +317,7 @@ def validate_chunk(
     # Run checks in-memory — no DB access needed
     collected_errors: list[dict] = []
     failed_event_ids: set[int] = set()
+    checks = _checks_for_content_type(content_type)
 
     for snap in events_snapshot:
         event_errors: list[tuple[str, str, dict]] = []
@@ -238,7 +330,7 @@ def validate_chunk(
 
         proxy = _Proxy()
 
-        for check_fn in _CHECKS:
+        for check_fn in checks:
             event_errors.extend(check_fn(proxy))  # type: ignore[arg-type]
 
         if event_errors:
@@ -247,7 +339,7 @@ def validate_chunk(
                 collected_errors.append(dict(
                     file_id=file_id,
                     subtitle_event_id=snap["id"],
-                    severity="error",
+                    severity="blocker",
                     qa_type=qa_type,
                     message=message,
                     details_json=json.dumps(details) if details else None,
@@ -262,12 +354,15 @@ def validate_chunk(
     progress(0.6, f"Writing results ({len(collected_errors)} errors)")
 
     with SyncSessionLocal() as session:
-        # Delete all unresolved qa_items for target events (validation resets the full review state)
+        # Delete all unresolved qa_items for target events (validation resets
+        # the full review state). Multi-fragment typeset notices come from
+        # translate_chunk, which runs before this reset — preserve them.
         if target_event_ids:
             session.execute(
                 delete(QaItem).where(
                     QaItem.subtitle_event_id.in_(target_event_ids),
                     QaItem.is_resolved == 0,
+                    QaItem.qa_type != FRAGMENT_QA_TYPE,
                 )
             )
 

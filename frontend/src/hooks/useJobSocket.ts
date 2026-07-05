@@ -8,10 +8,8 @@ const CHUNK_JOB_TYPES = new Set([
   'translate_chunk',
   'validate_chunk',
   'repair_chunk',
-  'review_chunk_rules',
-  'review_chunk_grammar',
-  'review_chunk_languagetool',
-  'review_chunk_llm',
+  'polish_chunk',
+  'review_chunk_final',
 ]);
 
 function parseJsonObject(value?: string | null): Record<string, unknown> | null {

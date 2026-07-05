@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from app.jobs.handlers.validate_chunk import (
     _check_escape_mismatch,
     _check_formatting_tag_mismatch,
+    _check_formatting_tag_mismatch_relaxed,
     _check_text_corruption,
+    _checks_for_content_type,
+    _check_missing_translation,
+    _check_locked_line_modified,
 )
 
 
@@ -100,6 +104,32 @@ def test_text_corruption_allows_double_brace_ass_override():
     assert issues == []
 
 
+def test_formatting_check_allows_moved_inline_tag_block():
+    # Tag masking reinserts blocks where the model placed their markers, so
+    # an inline italics span legitimately moves with the word it wraps —
+    # the dialogue check compares the multiset of exact blocks, not order.
+    source = r"I {\i1}really{\i0} mean it"
+    translated = r"Myslím to {\i0}vážně{\i1}"
+
+    issues = _check_formatting_tag_mismatch(
+        EventProxy(translated_text=translated, source_text=source)  # type: ignore[arg-type]
+    )
+
+    assert issues == []
+
+
+def test_formatting_check_rejects_altered_tag_block():
+    source = r"{\an8}Hello"
+    translated = r"{\an2}Ahoj"  # block content changed, not just moved
+
+    issues = _check_formatting_tag_mismatch(
+        EventProxy(translated_text=translated, source_text=source)  # type: ignore[arg-type]
+    )
+
+    assert issues
+    assert issues[0][0] == "formatting_tag_mismatch"
+
+
 def test_formatting_check_still_rejects_missing_ass_override():
     issues = _check_formatting_tag_mismatch(
         EventProxy(
@@ -110,3 +140,93 @@ def test_formatting_check_still_rejects_missing_ass_override():
 
     assert issues
     assert issues[0][0] == "formatting_tag_mismatch"
+
+
+def test_relaxed_tag_check_allows_reordered_and_regrouped_tag_blocks():
+    # Same set of tag names (pos, an), but reflowed into a different block
+    # grouping/order — the strict check would reject this, the relaxed
+    # (multiset) check used for sign/song content should accept it.
+    source = r"{\pos(100,200)}{\an7}Shop Sign"
+    translated = r"{\an7\pos(100,200)}Obchod"
+
+    issues = _check_formatting_tag_mismatch_relaxed(
+        EventProxy(translated_text=translated, source_text=source)  # type: ignore[arg-type]
+    )
+
+    assert issues == []
+
+
+def test_relaxed_tag_check_still_catches_missing_tag():
+    source = r"{\pos(100,200)}{\an7}Shop Sign"
+    translated = r"{\an7}Obchod"  # \pos dropped entirely
+
+    issues = _check_formatting_tag_mismatch_relaxed(
+        EventProxy(translated_text=translated, source_text=source)  # type: ignore[arg-type]
+    )
+
+    assert issues
+    assert issues[0][0] == "formatting_tag_mismatch"
+
+
+def test_relaxed_tag_check_still_catches_unclosed_block():
+    source = r"{\an7}Shop Sign"
+    translated = r"{\an7 Obchod"  # unclosed override block
+
+    issues = _check_formatting_tag_mismatch_relaxed(
+        EventProxy(translated_text=translated, source_text=source)  # type: ignore[arg-type]
+    )
+
+    assert issues
+    assert issues[0][2]["unclosed_block"] is True
+
+
+def test_checks_for_content_type_dialogue_uses_strict_tag_check():
+    checks = _checks_for_content_type("dialogue")
+    assert _check_formatting_tag_mismatch in checks
+    assert _check_formatting_tag_mismatch_relaxed not in checks
+
+
+def test_checks_for_content_type_sign_and_song_use_relaxed_tag_check():
+    for content_type in ("sign", "song"):
+        checks = _checks_for_content_type(content_type)
+        assert _check_formatting_tag_mismatch_relaxed in checks
+        assert _check_formatting_tag_mismatch not in checks
+
+
+def test_checks_for_content_type_karaoke_skips_tag_check_entirely():
+    checks = _checks_for_content_type("karaoke")
+    assert _check_formatting_tag_mismatch not in checks
+    assert _check_formatting_tag_mismatch_relaxed not in checks
+    # Other structural checks (missing translation, locked line) still apply.
+    assert _check_missing_translation in checks
+    assert _check_locked_line_modified in checks
+
+
+def test_missing_translation_ignores_empty_source_line():
+    # An empty (or markup-only) source line has nothing to translate — an
+    # empty translation is the correct outcome, not a missing one.
+    issues = _check_missing_translation(
+        EventProxy(translated_text="", source_text="")  # type: ignore[arg-type]
+    )
+
+    assert issues == []
+
+
+def test_missing_translation_ignores_markup_only_source_line():
+    issues = _check_missing_translation(
+        EventProxy(
+            translated_text=r"{\fad(0,500)}",
+            source_text=r"{\fad(0,500)}",
+        )  # type: ignore[arg-type]
+    )
+
+    assert issues == []
+
+
+def test_missing_translation_still_flags_empty_translation_of_real_text():
+    issues = _check_missing_translation(
+        EventProxy(translated_text="", source_text="Hello there")  # type: ignore[arg-type]
+    )
+
+    assert issues
+    assert issues[0][0] == "missing_translation"

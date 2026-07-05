@@ -29,14 +29,20 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import AsyncSessionLocal, SyncSessionLocal
-from app.db.default_prompts import DEFAULT_REPAIR_PROMPT, DEFAULT_TRANSLATION_PROMPT, DEFAULT_LLM_REVIEW_PROMPT
+from app.db.default_prompts import (
+    DEFAULT_POLISH_PROMPT,
+    DEFAULT_REPAIR_PROMPT,
+    DEFAULT_TRANSLATION_PROMPT,
+    DEFAULT_SIGN_TRANSLATION_PROMPT,
+    DEFAULT_SONG_TRANSLATION_PROMPT,
+)
 from app.db.models import Option
 
 
 # -- Typed options -------------------------------------------------------------
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-_VALID_GRAMMAR_PROVIDERS = {"languagetool", "korektor", "none"}
+_VALID_STRUCTURED_OUTPUT_MODES = {"auto", "json_schema", "json_object", "text"}
 
 
 @dataclass
@@ -44,20 +50,31 @@ class AppOptions:
     target_lang_name: str | None = None
     target_lang_code: str | None = None
     chunk_size: int = 100
-    prepend_context_size: int = 5
+    prepend_context_size: int = 10
     openai_api_base: str = "https://api.openai.com/v1"
     openai_api_key: str | None = None
     openai_model_cheap: str = "gpt-5.4-mini"
     openai_model_better: str = "gpt-5.4"
-    grammar_provider: str = "languagetool"
-    grammar_provider_base_url: str = "http://localhost:8010"
+    llm_structured_outputs: str = "auto"
+    llm_prices_json: str | None = None
+    llm_max_completion_tokens: int = 32768
+    translate_karaoke: bool = False
+    require_style_bible: bool = True
+    cps_limit: float = 20.0
+    max_row_chars: int = 42
+    # Deterministically rebalance over-long dialogue rows with \N before the
+    # readability check (long_row then only flags what a split can't fix).
+    auto_line_break: bool = True
+    auto_accept_policy: str = "fully_clean"  # manual | fully_clean | no_blockers
+    auto_mapping_accept_threshold: float = 0.8
+    translation_confidence_flag_threshold: float = 0.55
     log_level: str = "INFO"
     job_worker_count: int = 4
-    llm_review_always: bool = False
-    llm_review_flagged_only: bool = True
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT
     repair_prompt: str = DEFAULT_REPAIR_PROMPT
-    review_prompt: str = DEFAULT_LLM_REVIEW_PROMPT
+    polish_prompt: str = DEFAULT_POLISH_PROMPT
+    sign_translation_prompt: str = DEFAULT_SIGN_TRANSLATION_PROMPT
+    song_translation_prompt: str = DEFAULT_SONG_TRANSLATION_PROMPT
 
     @classmethod
     def from_dict(cls, d: dict[str, str | None]) -> "AppOptions":
@@ -67,36 +84,53 @@ class AppOptions:
             target_lang_name=d.get("TARGET_LANG_NAME"),
             target_lang_code=d.get("TARGET_LANG_CODE"),
             chunk_size=int(raw_chunk_size) if raw_chunk_size is not None else 100,
-            prepend_context_size=int(raw_context_size) if raw_context_size is not None else 5,
+            prepend_context_size=int(raw_context_size) if raw_context_size is not None else 10,
             openai_api_base=d.get("OPENAI_API_BASE") or "https://api.openai.com/v1",
             openai_api_key=d.get("OPENAI_API_KEY"),
             openai_model_cheap=d.get("OPENAI_MODEL_CHEAP") or "gpt-5.4-mini",
             openai_model_better=d.get("OPENAI_MODEL_BETTER") or "gpt-5.4",
-            grammar_provider=_validated_grammar_provider(d.get("GRAMMAR_PROVIDER")),
-            grammar_provider_base_url=_validated_grammar_provider_base_url(
-                d.get("GRAMMAR_PROVIDER_BASE_URL"),
-                d.get("LANGUAGETOOL_URL"),
-            ),
+            llm_structured_outputs=_validated_structured_outputs(d.get("LLM_STRUCTURED_OUTPUTS")),
+            llm_prices_json=d.get("LLM_PRICES_JSON"),
+            llm_max_completion_tokens=_validated_positive_int(
+                d.get("LLM_MAX_COMPLETION_TOKENS"), "LLM_MAX_COMPLETION_TOKENS", 32768),
+            translate_karaoke=_validated_bool(d.get("TRANSLATE_KARAOKE")),
+            require_style_bible=_validated_bool_default_true(d.get("REQUIRE_STYLE_BIBLE")),
+            cps_limit=_validated_positive_float(d.get("CPS_LIMIT"), "CPS_LIMIT", 20.0),
+            max_row_chars=_validated_positive_int(d.get("MAX_ROW_CHARS"), "MAX_ROW_CHARS", 42),
+            auto_line_break=_validated_bool_default_true(d.get("AUTO_LINE_BREAK")),
+            auto_accept_policy=_validated_auto_accept_policy(d.get("AUTO_ACCEPT_POLICY")),
+            auto_mapping_accept_threshold=_validated_ratio(
+                d.get("AUTO_MAPPING_ACCEPT_THRESHOLD"), "AUTO_MAPPING_ACCEPT_THRESHOLD", 0.8),
+            translation_confidence_flag_threshold=_validated_ratio(
+                d.get("TRANSLATION_CONFIDENCE_FLAG_THRESHOLD"),
+                "TRANSLATION_CONFIDENCE_FLAG_THRESHOLD", 0.55),
             log_level=_validated_log_level(d.get("LOG_LEVEL")),
             job_worker_count=_validated_worker_count(d.get("JOB_WORKER_COUNT")),
-            llm_review_always=_validated_bool(d.get("LLM_REVIEW_ALWAYS")),
-            llm_review_flagged_only=_validated_bool_default_true(d.get("LLM_REVIEW_FLAGGED_ONLY")),
             translation_prompt=d.get("TRANSLATION_PROMPT") or DEFAULT_TRANSLATION_PROMPT,
             repair_prompt=d.get("REPAIR_PROMPT") or DEFAULT_REPAIR_PROMPT,
-            review_prompt=d.get("REVIEW_PROMPT") or DEFAULT_LLM_REVIEW_PROMPT,
+            polish_prompt=d.get("POLISH_PROMPT") or DEFAULT_POLISH_PROMPT,
+            sign_translation_prompt=d.get("SIGN_TRANSLATION_PROMPT") or DEFAULT_SIGN_TRANSLATION_PROMPT,
+            song_translation_prompt=d.get("SONG_TRANSLATION_PROMPT") or DEFAULT_SONG_TRANSLATION_PROMPT,
         )
 
-    def resolved_translation_prompt(self) -> str:
+    def _resolve(self, prompt: str) -> str:
         lang = self.target_lang_name or "the target language"
-        return self.translation_prompt.replace("{TARGET_LANG_NAME}", lang)
+        return prompt.replace("{TARGET_LANG_NAME}", lang)
+
+    def resolved_translation_prompt(self) -> str:
+        return self._resolve(self.translation_prompt)
 
     def resolved_repair_prompt(self) -> str:
-        lang = self.target_lang_name or "the target language"
-        return self.repair_prompt.replace("{TARGET_LANG_NAME}", lang)
+        return self._resolve(self.repair_prompt)
 
-    def resolved_review_prompt(self) -> str:
-        lang = self.target_lang_name or "the target language"
-        return self.review_prompt.replace("{TARGET_LANG_NAME}", lang)
+    def resolved_polish_prompt(self) -> str:
+        return self._resolve(self.polish_prompt)
+
+    def resolved_sign_translation_prompt(self) -> str:
+        return self._resolve(self.sign_translation_prompt)
+
+    def resolved_song_translation_prompt(self) -> str:
+        return self._resolve(self.song_translation_prompt)
 
 
 # -- Validation helpers --------------------------------------------------------
@@ -114,13 +148,13 @@ def _validated_log_level(raw: str | None) -> str:
     return normalized
 
 
-def _validated_grammar_provider(raw: str | None) -> str:
+def _validated_structured_outputs(raw: str | None) -> str:
     if raw is None:
-        return "languagetool"
+        return "auto"
     normalized = raw.strip().lower()
-    if normalized not in _VALID_GRAMMAR_PROVIDERS:
-        _logger.warning("Invalid GRAMMAR_PROVIDER %r, falling back to languagetool", raw)
-        return "languagetool"
+    if normalized not in _VALID_STRUCTURED_OUTPUT_MODES:
+        _logger.warning("Invalid LLM_STRUCTURED_OUTPUTS %r, falling back to auto", raw)
+        return "auto"
     return normalized
 
 
@@ -137,11 +171,59 @@ def _validated_bool_default_true(raw: str | None) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _validated_grammar_provider_base_url(raw: str | None, legacy_raw: str | None) -> str:
-    if raw is None and legacy_raw is None:
-        return "http://localhost:8010"
-    selected = raw if raw is not None else legacy_raw
-    return selected.strip() if selected is not None else ""
+def _validated_positive_int(raw: str | None, name: str, default: int) -> int:
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning("Invalid %s %r, falling back to %d", name, raw, default)
+        return default
+    if value <= 0:
+        _logger.warning("%s must be > 0, got %d, falling back to %d", name, value, default)
+        return default
+    return value
+
+
+def _validated_positive_float(raw: str | None, name: str, default: float) -> float:
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning("Invalid %s %r, falling back to %s", name, raw, default)
+        return default
+    if value <= 0:
+        _logger.warning("%s must be > 0, got %s, falling back to %s", name, value, default)
+        return default
+    return value
+
+
+_VALID_AUTO_ACCEPT_POLICIES = {"manual", "fully_clean", "no_blockers"}
+
+
+def _validated_auto_accept_policy(raw: str | None) -> str:
+    if raw is None:
+        return "fully_clean"
+    normalized = raw.strip().lower()
+    if normalized not in _VALID_AUTO_ACCEPT_POLICIES:
+        _logger.warning("Invalid AUTO_ACCEPT_POLICY %r, falling back to fully_clean", raw)
+        return "fully_clean"
+    return normalized
+
+
+def _validated_ratio(raw: str | None, name: str, default: float) -> float:
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning("Invalid %s %r, falling back to %s", name, raw, default)
+        return default
+    if value < 0.0 or value > 1.0:
+        _logger.warning("%s must be in [0,1], got %r, falling back to %s", name, raw, default)
+        return default
+    return value
 
 
 def _validated_worker_count(raw: str | None) -> int:

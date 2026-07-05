@@ -97,7 +97,7 @@ export function useResolveQaIssue() {
       );
       const issue = context?.issue;
       if (!issue) return;
-      const isError = ['critical', 'error', 'high'].includes(issue.severity.toLowerCase());
+      const isError = ['blocker', 'critical', 'error', 'high'].includes(issue.severity.toLowerCase());
       queryClient.setQueryData<VideoFile[]>(
         ['projects', variables.projectId, 'files'],
         (files) => files?.map((file) => {

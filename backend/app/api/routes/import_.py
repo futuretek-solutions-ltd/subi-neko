@@ -8,9 +8,10 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.db.models import Project, ProjectCharacter
+from app.db.models import Project
 from app.jobs.manager import job_manager
 from app.metadata.registry import get_provider
+from app.metadata.sync import upsert_characters, upsert_episodes
 from app.orchestrator.orchestrator import orchestrate_project
 
 router = APIRouter(prefix="/import", tags=["import"])
@@ -91,24 +92,28 @@ async def import_project(body: ImportRequest) -> ImportResultOut:
     except IntegrityError:
         raise HTTPException(status_code=409, detail="Directory already imported")
 
-    # Fetch + store characters in a separate transaction (best-effort)
+    # Fetch + store characters and episode metadata in a separate
+    # transaction (best-effort — the project works without them).
     try:
         provider = get_provider(body.provider)
         characters = await provider.get_characters(body.provider_id)
-        if characters:
+        episodes = await provider.get_episodes(body.provider_id)
+        if not characters:
+            # Not an error, but a real quality gap: no genders, no mapping
+            # targets. The context panel surfaces this as an attention item.
+            logger.warning(
+                "Provider %s returned no characters for %s (project %d) — "
+                "speaker mapping will have an empty roster",
+                body.provider, body.provider_id, project.id,
+            )
+        if characters or episodes:
             async with AsyncSessionLocal() as session:
-                for char in characters:
-                    session.add(ProjectCharacter(
-                        project_id=project.id,
-                        external_id=char.provider_id,
-                        name=char.name,
-                        role=char.role.value if char.role else None,
-                        gender=char.gender,
-                    ))
+                await upsert_characters(session, project.id, characters)
+                await upsert_episodes(session, project.id, episodes)
                 await session.commit()
     except Exception:
         logger.warning(
-            "Failed to fetch characters for %s/%s (project %d created without characters)",
+            "Failed to fetch metadata for %s/%s (project %d created without characters/episodes)",
             body.provider, body.provider_id, project.id, exc_info=True,
         )
 

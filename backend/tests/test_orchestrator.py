@@ -54,12 +54,20 @@ async def db_session(monkeypatch):
     monkeypatch.setattr("app.orchestrator.chunk_orchestrator.AsyncSessionLocal", session_factory)
     monkeypatch.setattr("app.orchestrator.file_orchestrator.AsyncSessionLocal", session_factory)
     monkeypatch.setattr("app.orchestrator.project_orchestrator.AsyncSessionLocal", session_factory)
+    monkeypatch.setattr("app.orchestrator.context_status.AsyncSessionLocal", session_factory)
     monkeypatch.setattr("app.api.routes.projects.AsyncSessionLocal", session_factory)
     monkeypatch.setattr("app.jobs.manager.AsyncSessionLocal", session_factory)
+    monkeypatch.setattr("app.db.options.AsyncSessionLocal", session_factory)
+
+    # Options are cached module-globally — reset so each test reads from the
+    # fresh in-memory DB (and gets pure defaults).
+    from app.db import options as options_store
+    options_store.invalidate()
 
     async with session_factory() as session:
         yield session
 
+    options_store.invalidate()
     await engine.dispose()
 
 
@@ -75,15 +83,23 @@ async def _create_project(
     session: AsyncSession,
     status: str = "new",
     speaker_mapping_status: str = "awaiting_discovery",
+    context_approved: bool | None = None,
+    source_directory: str = "test",
 ) -> Project:
+    effective_status = "processing" if status == "paused" else status
+    # Default mirrors the migration's grandfathering: projects already past
+    # discovery count as context-approved unless a test says otherwise.
+    if context_approved is None:
+        context_approved = effective_status in ("processing", "review_required", "completed")
     p = Project(
         name="Test Project",
-        source_directory="test",
+        source_directory=source_directory,
         anime_provider="test",
         anime_external_id="test-1",
-        status="processing" if status == "paused" else status,
+        status=effective_status,
         is_paused=1 if status == "paused" else 0,
         speaker_mapping_status=speaker_mapping_status,
+        context_approved_at=datetime.utcnow().isoformat() if context_approved else None,
         created_at=datetime.utcnow().isoformat(),
         updated_at=datetime.utcnow().isoformat(),
     )
@@ -99,14 +115,21 @@ async def _create_file(
     status: str = "new",
     blocking_reason: str | None = None,
     subtitle_track_index: int | None = None,
+    translation_requested: bool | None = None,
+    relative_path: str = "test.mkv",
 ) -> File:
+    # Default mirrors the migration's grandfathering: any file past discovery
+    # counts as translation-requested unless a test says otherwise.
+    if translation_requested is None:
+        translation_requested = status not in ("new", "discovering")
     f = File(
         project_id=project_id,
-        filename="test.mkv",
-        relative_path="test.mkv",
+        filename=relative_path,
+        relative_path=relative_path,
         status=status,
         blocking_reason=blocking_reason,
         subtitle_track_index=subtitle_track_index,
+        translation_requested_at=datetime.utcnow().isoformat() if translation_requested else None,
         created_at=datetime.utcnow().isoformat(),
         updated_at=datetime.utcnow().isoformat(),
     )
@@ -202,10 +225,38 @@ async def _create_job(
     return j
 
 
+async def _create_style_bible(session: AsyncSession, project_id: int):
+    from app.db.models import ProjectStyleBible
+    b = ProjectStyleBible(
+        project_id=project_id,
+        version=1,
+        tone_summary="test tone",
+        created_at=datetime.utcnow().isoformat(),
+        updated_at=datetime.utcnow().isoformat(),
+    )
+    session.add(b)
+    await session.commit()
+    return b
+
+
+async def _create_analysis(session: AsyncSession, file_id: int):
+    from app.db.models import FileAnalysis
+    a = FileAnalysis(
+        file_id=file_id,
+        synopsis="test synopsis",
+        scenes_json="[]",
+        tricky_lines_json="[]",
+        created_at=datetime.utcnow().isoformat(),
+    )
+    session.add(a)
+    await session.commit()
+    return a
+
+
 async def _create_qa_item(
     session: AsyncSession,
     file_id: int,
-    severity: str = "error",
+    severity: str = "blocker",
     is_resolved: int = 0,
 ) -> QaItem:
     q = QaItem(
@@ -301,47 +352,60 @@ class TestChunkOrchestrator:
         assert call_kwargs["job_type"] == "repair_chunk"
 
     @pytest.mark.asyncio
-    async def test_grammar_reviewed_no_llm_sets_complete(self, db_session, enqueue_mock):
+    async def test_validated_enqueues_polish(self, db_session, enqueue_mock):
         from app.orchestrator.chunk_orchestrator import orchestrate_chunks
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
-        chunk = await _create_chunk(db_session, file.id, 0, status="grammar_reviewed", llm_review_needed=False)
-
-        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
-
-        assert result is True
-        enqueue_mock.assert_not_called()
-
-        # Verify chunk status in DB
-        await db_session.refresh(chunk)
-        assert chunk.status == "complete"
-
-    @pytest.mark.asyncio
-    async def test_grammar_reviewed_with_llm_enqueues_llm(self, db_session, enqueue_mock):
-        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
-
-        project = await _create_project(db_session, status="processing")
-        file = await _create_file(db_session, project.id, status="processing")
-        await _create_chunk(db_session, file.id, 0, status="grammar_reviewed", llm_review_needed=True)
+        await _create_chunk(db_session, file.id, 0, status="validated")
 
         result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
 
         assert result is False
         call_kwargs = enqueue_mock.call_args.kwargs
-        assert call_kwargs["job_type"] == "review_chunk_llm"
+        assert call_kwargs["job_type"] == "polish_chunk"
+        assert call_kwargs["dedupe_key"] == f"polish_chunk:{file.id}:0"
 
     @pytest.mark.asyncio
-    async def test_llm_reviewed_sets_complete(self, db_session, enqueue_mock):
+    async def test_polished_enqueues_final_review(self, db_session, enqueue_mock):
         from app.orchestrator.chunk_orchestrator import orchestrate_chunks
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
-        chunk = await _create_chunk(db_session, file.id, 0, status="llm_reviewed")
+        await _create_chunk(db_session, file.id, 0, status="polished")
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        call_kwargs = enqueue_mock.call_args.kwargs
+        assert call_kwargs["job_type"] == "review_chunk_final"
+
+    @pytest.mark.asyncio
+    async def test_needs_polish_enqueues_polish(self, db_session, enqueue_mock):
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="needs_polish")
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        call_kwargs = enqueue_mock.call_args.kwargs
+        assert call_kwargs["job_type"] == "polish_chunk"
+
+    @pytest.mark.asyncio
+    async def test_final_reviewed_sets_complete(self, db_session, enqueue_mock):
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        chunk = await _create_chunk(db_session, file.id, 0, status="final_reviewed")
 
         result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
 
         assert result is True
+        enqueue_mock.assert_not_called()
         await db_session.refresh(chunk)
         assert chunk.status == "complete"
 
@@ -372,22 +436,108 @@ class TestChunkOrchestrator:
 
         assert result is False
         call_kwargs = enqueue_mock.call_args.kwargs
-        assert call_kwargs["job_type"] == "review_chunk_rules"
+        assert call_kwargs["job_type"] == "polish_chunk"
 
     @pytest.mark.asyncio
-    async def test_rules_reviewed_enqueues_grammar(self, db_session, enqueue_mock):
+    async def test_sequential_gating_holds_second_pending_chunk(self, db_session, enqueue_mock):
+        """Chunk N must not translate until chunk N-1 has left 'pending'."""
         from app.orchestrator.chunk_orchestrator import orchestrate_chunks
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
-        await _create_chunk(db_session, file.id, 0, status="rules_reviewed")
+        await _create_chunk(db_session, file.id, 0, status="pending")
+        await _create_chunk(db_session, file.id, 1, status="pending")
 
         result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
 
         assert result is False
+        # Only chunk 0's translate job is enqueued; chunk 1 waits.
+        enqueue_mock.assert_called_once()
         call_kwargs = enqueue_mock.call_args.kwargs
-        assert call_kwargs["job_type"] == "review_chunk_grammar"
-        assert call_kwargs["dedupe_key"] == f"review_chunk_grammar:file:{file.id}:chunk:0"
+        assert call_kwargs["job_type"] == "translate_chunk"
+        assert call_kwargs["dedupe_key"] == f"translate_chunk:{file.id}:0"
+
+    @pytest.mark.asyncio
+    async def test_sequential_gating_releases_after_previous_translated(self, db_session, enqueue_mock):
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="translated")
+        await _create_chunk(db_session, file.id, 1, status="pending")
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        job_types = {c.kwargs["job_type"] for c in enqueue_mock.call_args_list}
+        assert job_types == {"validate_chunk", "translate_chunk"}
+
+    @pytest.mark.asyncio
+    async def test_sequential_gating_ignores_blocked_predecessor(self, db_session, enqueue_mock):
+        """A terminal predecessor must not deadlock the next chunk."""
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="job_failed")
+        await _create_chunk(db_session, file.id, 1, status="pending")
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False  # chunk 1 still progressing
+        enqueue_mock.assert_called_once()
+        assert enqueue_mock.call_args.kwargs["dedupe_key"] == f"translate_chunk:{file.id}:1"
+
+    @pytest.mark.asyncio
+    async def test_pending_karaoke_chunk_skipped_when_option_off(self, db_session, enqueue_mock, monkeypatch):
+        from app.db import options as options_store
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        async def fake_aget(name, default=None):
+            return "0"
+        monkeypatch.setattr(options_store, "aget", fake_aget)
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        chunk = await _create_chunk(db_session, file.id, 0, status="pending")
+        chunk.content_type = "karaoke"
+        await db_session.commit()
+
+        # Karaoke events in range get translation_status="skipped"
+        event = await _create_event(db_session, file.id, line_index=0,
+                                    translated_text=None, original_ai_translated_text=None)
+        event.content_type = "karaoke"
+        await db_session.commit()
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is True
+        enqueue_mock.assert_not_called()
+        await db_session.refresh(chunk)
+        assert chunk.status == "complete"
+        await db_session.refresh(event)
+        assert event.translation_status == "skipped"
+        assert event.translated_text is None  # original line kept at render time
+
+    @pytest.mark.asyncio
+    async def test_pending_karaoke_chunk_translates_when_option_on(self, db_session, enqueue_mock, monkeypatch):
+        from app.db import options as options_store
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        async def fake_aget(name, default=None):
+            return "1"
+        monkeypatch.setattr(options_store, "aget", fake_aget)
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        chunk = await _create_chunk(db_session, file.id, 0, status="pending")
+        chunk.content_type = "karaoke"
+        await db_session.commit()
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        assert enqueue_mock.call_args.kwargs["job_type"] == "translate_chunk"
 
 
 # ===========================================================================
@@ -435,7 +585,7 @@ class TestFileOrchestrator:
     async def test_discovering_with_subtitles_mapping_complete_sets_ready(self, db_session, enqueue_mock):
         from app.orchestrator.file_orchestrator import orchestrate_file
 
-        project = await _create_project(db_session, status="processing", speaker_mapping_status="mapping_complete")
+        project = await _create_project(db_session, status="processing", speaker_mapping_status="complete")
         file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
         await _create_subtitle(db_session, file.id)
 
@@ -446,43 +596,21 @@ class TestFileOrchestrator:
         assert file.blocking_reason is None
 
     @pytest.mark.asyncio
-    async def test_discovering_with_subtitles_mapping_required_sets_waiting(self, db_session, enqueue_mock):
+    async def test_discovering_with_subtitles_sets_ready_even_before_mapping(self, db_session, enqueue_mock):
+        """Files go ready as soon as their subtitles are extracted — speaker
+        mapping is enforced by the project-level context gate, not per file."""
         from app.orchestrator.file_orchestrator import orchestrate_file
 
-        project = await _create_project(db_session, status="waiting_for_mapping", speaker_mapping_status="mapping_required")
+        project = await _create_project(db_session, status="discovering", speaker_mapping_status="aggregated")
         file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
         await _create_subtitle(db_session, file.id)
 
         await orchestrate_file(file.id, enqueue_mock)
 
         await db_session.refresh(file)
-        assert file.status == "waiting"
-        assert file.blocking_reason == "project_mapping_required"
-
-    @pytest.mark.asyncio
-    async def test_waiting_mapping_complete_sets_ready(self, db_session, enqueue_mock):
-        from app.orchestrator.file_orchestrator import orchestrate_file
-
-        project = await _create_project(db_session, status="processing", speaker_mapping_status="mapping_complete")
-        file = await _create_file(db_session, project.id, status="waiting", blocking_reason="project_mapping_required")
-
-        await orchestrate_file(file.id, enqueue_mock)
-
-        await db_session.refresh(file)
         assert file.status == "ready"
         assert file.blocking_reason is None
-
-    @pytest.mark.asyncio
-    async def test_waiting_no_speakers_sets_ready(self, db_session, enqueue_mock):
-        from app.orchestrator.file_orchestrator import orchestrate_file
-
-        project = await _create_project(db_session, status="processing", speaker_mapping_status="no_speakers")
-        file = await _create_file(db_session, project.id, status="waiting", blocking_reason="project_mapping_required")
-
-        await orchestrate_file(file.id, enqueue_mock)
-
-        await db_session.refresh(file)
-        assert file.status == "ready"
+        enqueue_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_ready_unchecked_fonts_enqueues_resolve(self, db_session, enqueue_mock):
@@ -511,13 +639,63 @@ class TestFileOrchestrator:
         assert call_kwargs["job_type"] == "plan_translation_chunks"
 
     @pytest.mark.asyncio
-    async def test_ready_with_fonts_and_chunks_sets_processing(self, db_session, enqueue_mock):
+    async def test_ready_inert_until_context_approved(self, db_session, enqueue_mock):
+        """Gate 1: with the project's context unapproved, a ready file must
+        not start anything — even when its Translate flag is set."""
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        project = await _create_project(db_session, status="processing", context_approved=False)
+        file = await _create_file(db_session, project.id, status="ready", translation_requested=True)
+        await _create_style(db_session, file.id, font_check_status="unchecked")
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "ready"
+        enqueue_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ready_inert_until_translate_requested(self, db_session, enqueue_mock):
+        """Gate 2: an approved project's ready file waits for its own
+        Translate action before any per-file job is enqueued."""
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        project = await _create_project(db_session, status="processing", context_approved=True)
+        file = await _create_file(db_session, project.id, status="ready", translation_requested=False)
+        await _create_style(db_session, file.id, font_check_status="unchecked")
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "ready"
+        enqueue_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ready_with_bible_but_no_analysis_enqueues_analyze(self, db_session, enqueue_mock):
         from app.orchestrator.file_orchestrator import orchestrate_file
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="ready")
         await _create_style(db_session, file.id, font_check_status="checked")
         await _create_chunk(db_session, file.id, 0, status="pending")
+        await _create_style_bible(db_session, project.id)
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        call_kwargs = enqueue_mock.call_args.kwargs
+        assert call_kwargs["job_type"] == "analyze_script"
+        assert call_kwargs["dedupe_key"] == f"analyze_script:{file.id}"
+
+    @pytest.mark.asyncio
+    async def test_ready_with_fonts_chunks_bible_and_analysis_sets_processing(self, db_session, enqueue_mock):
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="ready")
+        await _create_style(db_session, file.id, font_check_status="checked")
+        await _create_chunk(db_session, file.id, 0, status="pending")
+        await _create_style_bible(db_session, project.id)
+        await _create_analysis(db_session, file.id)
 
         await orchestrate_file(file.id, enqueue_mock)
 
@@ -525,8 +703,91 @@ class TestFileOrchestrator:
         assert file.status == "processing"
 
     @pytest.mark.asyncio
-    async def test_processing_all_chunks_complete_no_qa_sets_review(self, db_session, enqueue_mock):
+    async def test_ready_without_bible_still_proceeds(self, db_session, enqueue_mock):
+        """The style-bible gate lives at the project level now — a started
+        file only needs fonts, chunks and its own analysis."""
         from app.orchestrator.file_orchestrator import orchestrate_file
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="ready")
+        await _create_style(db_session, file.id, font_check_status="checked")
+        await _create_chunk(db_session, file.id, 0, status="pending")
+        await _create_analysis(db_session, file.id)
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "processing"
+
+    @pytest.mark.asyncio
+    async def test_ready_analysis_failed_permanently_parks_file(self, db_session, enqueue_mock):
+        """Script analysis is a hard gate: a permanently failed job parks the
+        file in waiting/analysis_failed instead of translating without context."""
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="ready")
+        await _create_style(db_session, file.id, font_check_status="checked")
+        await _create_chunk(db_session, file.id, 0, status="pending")
+        await _create_job(db_session, project.id, "analyze_script",
+                          f"analyze_script:{file.id}", status="failed", file_id=file.id)
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "waiting"
+        assert file.blocking_reason == "analysis_failed"
+        enqueue_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_waiting_analysis_failed_is_inert(self, db_session, enqueue_mock):
+        """A file parked on analysis_failed waits for the user's Translate
+        retry — the sweep must not re-enqueue anything for it."""
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="waiting",
+                                  blocking_reason="analysis_failed")
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "waiting"
+        enqueue_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_processing_all_chunks_complete_no_qa_auto_accepts(self, db_session, enqueue_mock, monkeypatch):
+        """Default policy fully_clean: a file with zero unresolved QA items
+        of any severity auto-muxes without a human accept click."""
+        from app.orchestrator import file_orchestrator
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        monkeypatch.setattr(file_orchestrator, "_populate_translation_memory_sync",
+                            lambda project_id, file_id: 0)
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="complete")
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "muxing"
+        assert file.blocking_reason is None
+        # Acceptance feeds the style bible; muxing enqueues render next pass.
+        job_types = [c.kwargs["job_type"] for c in enqueue_mock.call_args_list]
+        assert "update_style_bible" in job_types
+
+    @pytest.mark.asyncio
+    async def test_processing_all_chunks_complete_no_qa_manual_policy_sets_review(
+        self, db_session, enqueue_mock, monkeypatch
+    ):
+        from app.db import options as options_store
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        async def fake_aget(name, default=None):
+            return "manual" if name == "AUTO_ACCEPT_POLICY" else default
+        monkeypatch.setattr(options_store, "aget", fake_aget)
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
@@ -539,13 +800,37 @@ class TestFileOrchestrator:
         assert file.blocking_reason == "user_review_required"
 
     @pytest.mark.asyncio
+    async def test_processing_complete_with_warning_no_blockers_policy_auto_accepts(
+        self, db_session, enqueue_mock, monkeypatch
+    ):
+        from app.db import options as options_store
+        from app.orchestrator import file_orchestrator
+        from app.orchestrator.file_orchestrator import orchestrate_file
+
+        async def fake_aget(name, default=None):
+            return "no_blockers" if name == "AUTO_ACCEPT_POLICY" else default
+        monkeypatch.setattr(options_store, "aget", fake_aget)
+        monkeypatch.setattr(file_orchestrator, "_populate_translation_memory_sync",
+                            lambda project_id, file_id: 0)
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="complete")
+        await _create_qa_item(db_session, file.id, severity="warning", is_resolved=0)
+
+        await orchestrate_file(file.id, enqueue_mock)
+
+        await db_session.refresh(file)
+        assert file.status == "muxing"
+
+    @pytest.mark.asyncio
     async def test_processing_all_chunks_complete_with_qa_sets_review(self, db_session, enqueue_mock):
         from app.orchestrator.file_orchestrator import orchestrate_file
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
         await _create_chunk(db_session, file.id, 0, status="complete")
-        await _create_qa_item(db_session, file.id, severity="error", is_resolved=0)
+        await _create_qa_item(db_session, file.id, severity="blocker", is_resolved=0)
 
         await orchestrate_file(file.id, enqueue_mock)
 
@@ -598,7 +883,11 @@ class TestFileOrchestrator:
             blocking_reason="user_review_required",
         )
 
-        with mock.patch("app.api.routes.projects.orchestrate_file") as mock_orchestrate:
+        with mock.patch("app.api.routes.projects.orchestrate_file") as mock_orchestrate, \
+             mock.patch("app.orchestrator.file_orchestrator._populate_translation_memory_sync",
+                        return_value=0) as mock_tm, \
+             mock.patch("app.api.routes.projects.job_manager") as mock_manager:
+            mock_manager.enqueue = mock.AsyncMock()
             result = await accept_file_review(project.id, file.id)
 
         await db_session.refresh(file)
@@ -606,9 +895,12 @@ class TestFileOrchestrator:
         assert file.status == "muxing"
         assert file.blocking_reason is None
         mock_orchestrate.assert_called_once()
+        # Accepting feeds the TM and schedules the style bible update.
+        mock_tm.assert_called_once_with(project.id, file.id)
+        assert mock_manager.enqueue.call_args.kwargs["job_type"] == "update_style_bible"
 
     @pytest.mark.asyncio
-    async def test_accept_file_review_rejects_unresolved_qa(self, db_session, enqueue_mock):
+    async def test_accept_file_review_rejects_unresolved_blockers(self, db_session, enqueue_mock):
         from app.api.routes.projects import accept_file_review
         from fastapi import HTTPException
 
@@ -619,12 +911,41 @@ class TestFileOrchestrator:
             status="review_required",
             blocking_reason="user_review_required",
         )
-        await _create_qa_item(db_session, file.id, severity="warning", is_resolved=0)
+        await _create_qa_item(db_session, file.id, severity="blocker", is_resolved=0)
 
         with pytest.raises(HTTPException) as exc_info:
             await accept_file_review(project.id, file.id)
 
         assert exc_info.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_accept_file_review_with_warnings_resolves_and_muxes(self, db_session, enqueue_mock):
+        """Warnings no longer block acceptance; resolve_warnings marks them
+        resolved as part of the accept."""
+        import unittest.mock as mock
+        from app.api.routes.projects import AcceptReviewIn, accept_file_review
+
+        project = await _create_project(db_session, status="review_required")
+        file = await _create_file(
+            db_session,
+            project.id,
+            status="review_required",
+            blocking_reason="user_review_required",
+        )
+        qa = await _create_qa_item(db_session, file.id, severity="warning", is_resolved=0)
+
+        with mock.patch("app.api.routes.projects.orchestrate_file"), \
+             mock.patch("app.orchestrator.file_orchestrator._populate_translation_memory_sync",
+                        return_value=0), \
+             mock.patch("app.api.routes.projects.job_manager") as mock_manager:
+            mock_manager.enqueue = mock.AsyncMock()
+            result = await accept_file_review(
+                project.id, file.id, AcceptReviewIn(resolve_warnings=True))
+
+        assert result.status == "muxing"
+        await db_session.refresh(qa)
+        assert qa.is_resolved == 1
+        assert qa.resolution_note == "accepted_with_file"
 
     @pytest.mark.asyncio
     async def test_update_subtitle_event_changes_translation_only(self, db_session, enqueue_mock):
@@ -774,6 +1095,71 @@ class TestProjectOrchestrator:
         assert project.status == "processing"
 
     @pytest.mark.asyncio
+    async def test_processing_waiting_plus_review_sets_review_required(self, db_session, enqueue_mock):
+        """One error-parked file must not hide reviewable siblings from the
+        project-level review signal."""
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="processing")
+        await _create_file(db_session, project.id, status="review_required",
+                           relative_path="e1.mkv")
+        await _create_file(db_session, project.id, status="waiting",
+                           blocking_reason="analysis_failed", relative_path="e2.mkv")
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "review_required"
+
+    @pytest.mark.asyncio
+    async def test_processing_waiting_only_sets_review_required(self, db_session, enqueue_mock):
+        """A waiting file needs user action — surface it as review_required."""
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="processing")
+        await _create_file(db_session, project.id, status="waiting",
+                           blocking_reason="analysis_failed")
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "review_required"
+
+    @pytest.mark.asyncio
+    async def test_processing_waiting_blocks_completed(self, db_session, enqueue_mock):
+        """Completed siblings never pull the project to COMPLETED while an
+        error-parked file remains."""
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="processing")
+        await _create_file(db_session, project.id, status="completed",
+                           relative_path="e1.mkv")
+        await _create_file(db_session, project.id, status="waiting",
+                           blocking_reason="analysis_failed", relative_path="e2.mkv")
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "review_required"
+
+    @pytest.mark.asyncio
+    async def test_review_required_holds_while_waiting_file_remains(self, db_session, enqueue_mock):
+        """No processing↔review ping-pong: a waiting file keeps the project
+        in review_required until the user acts on it."""
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="review_required")
+        await _create_file(db_session, project.id, status="completed",
+                           relative_path="e1.mkv")
+        await _create_file(db_session, project.id, status="waiting",
+                           blocking_reason="analysis_failed", relative_path="e2.mkv")
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "review_required"
+
+    @pytest.mark.asyncio
     async def test_paused_project_no_action(self, db_session, enqueue_mock):
         from app.orchestrator.project_orchestrator import orchestrate_project
 
@@ -784,20 +1170,170 @@ class TestProjectOrchestrator:
         enqueue_mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_waiting_for_mapping_mapping_complete_transitions(self, db_session, enqueue_mock):
+    async def test_discovering_aggregated_enqueues_inference(self, db_session, enqueue_mock):
+        """After speaker aggregation the orchestrator drives the automatic
+        mapping inference — no human gate anywhere."""
         from app.orchestrator.project_orchestrator import orchestrate_project
 
-        project = await _create_project(db_session, status="waiting_for_mapping", speaker_mapping_status="mapping_complete")
-        file = await _create_file(db_session, project.id, status="waiting", blocking_reason="project_mapping_required")
+        project = await _create_project(db_session, status="discovering", speaker_mapping_status="aggregated")
+        file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
+        await _create_subtitle(db_session, file.id)
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        job_types = [c.kwargs["job_type"] for c in enqueue_mock.call_args_list]
+        assert "infer_character_mapping" in job_types
+        await db_session.refresh(project)
+        assert project.status == "discovering"  # waits for the inference job
+
+    @pytest.mark.asyncio
+    async def test_discovering_mapping_complete_enqueues_style_bible(self, db_session, enqueue_mock):
+        """The style bible is generated at the project level, after mapping,
+        before the context-review handover."""
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="discovering", speaker_mapping_status="complete")
+        file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
+        await _create_subtitle(db_session, file.id)
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        job_types = {c.kwargs["job_type"]: c.kwargs for c in enqueue_mock.call_args_list}
+        assert "generate_style_bible" in job_types
+        assert job_types["generate_style_bible"]["dedupe_key"] == f"generate_style_bible:{project.id}"
+        assert job_types["generate_style_bible"]["payload"] == {
+            "project_id": project.id, "sample_file_id": file.id,
+        }
+        await db_session.refresh(project)
+        assert project.status == "discovering"  # gated on the bible job
+
+    @pytest.mark.asyncio
+    async def test_discovering_context_complete_transitions_to_context_review(self, db_session, enqueue_mock):
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="discovering", speaker_mapping_status="complete")
+        file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
+        await _create_subtitle(db_session, file.id)
+        await _create_style_bible(db_session, project.id)
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "context_review"
+        await db_session.refresh(file)
+        assert file.status == "ready"
+
+    @pytest.mark.asyncio
+    async def test_discovering_context_complete_skips_bible_when_option_off(
+        self, db_session, enqueue_mock, monkeypatch,
+    ):
+        from app.db import options as options_store
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        async def fake_aget(name, default=None):
+            return "0" if name == "REQUIRE_STYLE_BIBLE" else default
+        monkeypatch.setattr(options_store, "aget", fake_aget)
+
+        project = await _create_project(db_session, status="discovering", speaker_mapping_status="complete")
+        file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
+        await _create_subtitle(db_session, file.id)
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "context_review"
+
+    @pytest.mark.asyncio
+    async def test_discovering_blocks_on_failed_mapping_without_reenqueue(self, db_session, enqueue_mock):
+        """A permanently failed mapping job stops the project in discovering;
+        the sweep must not re-enqueue the failed job (that would reset it)."""
+        from app.orchestrator.context_status import compute_context_status
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="discovering", speaker_mapping_status="aggregated")
+        file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
+        await _create_subtitle(db_session, file.id)
+        await _create_job(db_session, project.id, "infer_character_mapping",
+                          f"infer_character_mapping:{project.id}", status="failed")
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "discovering"
+        assert "infer_character_mapping" not in [
+            c.kwargs["job_type"] for c in enqueue_mock.call_args_list
+        ]
+        status = await compute_context_status(project.id)
+        assert status["state"] == "failed"
+        mapping = next(c for c in status["components"] if c["key"] == "character_mapping")
+        assert mapping["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_discovering_blocks_on_failed_style_bible_without_reenqueue(self, db_session, enqueue_mock):
+        from app.orchestrator.context_status import compute_context_status
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="discovering", speaker_mapping_status="complete")
+        file = await _create_file(db_session, project.id, status="discovering", subtitle_track_index=1)
+        await _create_subtitle(db_session, file.id)
+        await _create_job(db_session, project.id, "generate_style_bible",
+                          f"generate_style_bible:{project.id}", status="failed")
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "discovering"
+        assert "generate_style_bible" not in [
+            c.kwargs["job_type"] for c in enqueue_mock.call_args_list
+        ]
+        status = await compute_context_status(project.id)
+        assert status["state"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_context_review_self_heals_to_processing_when_approved(self, db_session, enqueue_mock):
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(
+            db_session, status="context_review",
+            speaker_mapping_status="complete", context_approved=True,
+        )
 
         await orchestrate_project(project.id, enqueue_mock)
 
         await db_session.refresh(project)
         assert project.status == "processing"
 
-        await db_session.refresh(file)
-        assert file.status == "ready"
-        assert file.blocking_reason is None
+    @pytest.mark.asyncio
+    async def test_context_review_stays_until_approved(self, db_session, enqueue_mock):
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(
+            db_session, status="context_review",
+            speaker_mapping_status="complete", context_approved=False,
+        )
+        await _create_file(db_session, project.id, status="ready", translation_requested=False)
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "context_review"
+        enqueue_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_processing_stays_while_inert_ready_files_remain(self, db_session, enqueue_mock):
+        """Untranslated (never-started) files keep the project honestly in
+        processing — they don't count as done, and they aren't driven."""
+        from app.orchestrator.project_orchestrator import orchestrate_project
+
+        project = await _create_project(db_session, status="processing")
+        await _create_file(db_session, project.id, status="completed", relative_path="e1.mkv")
+        await _create_file(db_session, project.id, status="ready",
+                           translation_requested=False, relative_path="e2.mkv")
+
+        await orchestrate_project(project.id, enqueue_mock)
+
+        await db_session.refresh(project)
+        assert project.status == "processing"
 
 
 # ===========================================================================
@@ -897,7 +1433,7 @@ class TestChunkFailureStatuses:
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
-        await _create_chunk(db_session, file.id, 0, status="rules_reviewed")  # still progressing
+        await _create_chunk(db_session, file.id, 0, status="polished")  # still progressing
         await _create_chunk(db_session, file.id, 1, status="validate_repair_failed")  # blocked
 
         await orchestrate_file(file.id, enqueue_mock)
@@ -905,9 +1441,9 @@ class TestChunkFailureStatuses:
         await db_session.refresh(file)
         assert file.status == "processing"  # must NOT go to waiting
         assert file.blocking_reason is None
-        # Grammar job for chunk 0 must still be enqueued
+        # Final review job for chunk 0 must still be enqueued
         enqueue_mock.assert_called_once()
-        assert enqueue_mock.call_args.kwargs["job_type"] == "review_chunk_grammar"
+        assert enqueue_mock.call_args.kwargs["job_type"] == "review_chunk_final"
 
     @pytest.mark.asyncio
     async def test_processing_with_job_failed_chunk_sets_waiting_translation_failed(
@@ -972,8 +1508,8 @@ class TestChunkFailureStatuses:
         # File already in waiting state (set there by an earlier blocked chunk)
         file = await _create_file(db_session, project.id, status="waiting",
                                   blocking_reason="validation_failed")
-        # Chunk 0 has finished rules review and needs grammar
-        await _create_chunk(db_session, file.id, 0, status="rules_reviewed")
+        # Chunk 0 has been polished and needs its final review
+        await _create_chunk(db_session, file.id, 0, status="polished")
         # Chunk 1 is the one causing the block
         await _create_chunk(db_session, file.id, 1, status="validate_repair_failed")
 
@@ -984,9 +1520,9 @@ class TestChunkFailureStatuses:
         assert file.status == "waiting"
         assert file.blocking_reason == "validation_failed"
 
-        # But the grammar job for chunk 0 must have been enqueued
+        # But the final review job for chunk 0 must have been enqueued
         enqueue_mock.assert_called_once()
-        assert enqueue_mock.call_args.kwargs["job_type"] == "review_chunk_grammar"
+        assert enqueue_mock.call_args.kwargs["job_type"] == "review_chunk_final"
 
     @pytest.mark.asyncio
     async def test_waiting_file_with_completed_chunks_promotes_to_review_required(
@@ -1019,7 +1555,7 @@ class TestChunkFailureStatuses:
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
-        chunk = await _create_chunk(db_session, file.id, 0, status="rules_reviewed")
+        chunk = await _create_chunk(db_session, file.id, 0, status="polished")
 
         await _mark_chunk_job_failed(
             file.id,
@@ -1030,9 +1566,71 @@ class TestChunkFailureStatuses:
         )
 
         await db_session.refresh(chunk)
-        assert chunk.status == "rules_reviewed"
+        assert chunk.status == "polished"
         assert chunk.retry_count == 0
         assert chunk.failed_job_type is None
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_keeps_status_and_burns_budget(
+        self, db_session, enqueue_mock
+    ):
+        """A retryable failure (API error) leaves the chunk status untouched so
+        the orchestrator re-enqueues the same stage; only the budget is burned."""
+        from app.jobs.manager import _mark_chunk_job_failed
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        chunk = await _create_chunk(db_session, file.id, 0, status="pending")
+
+        await _mark_chunk_job_failed(
+            file.id, "translate_chunk", {"chunk_index": 0},
+            "OPENAI_API_ERROR", "Connection timeout",
+        )
+
+        await db_session.refresh(chunk)
+        assert chunk.status == "pending"  # NOT job_failed — will be re-enqueued
+        assert chunk.retry_count == 1
+        assert chunk.last_error_code == "OPENAI_API_ERROR"
+
+    @pytest.mark.asyncio
+    async def test_retryable_error_exhausted_budget_sets_job_failed(
+        self, db_session, enqueue_mock
+    ):
+        from app.jobs.manager import _MAX_CHUNK_AUTO_RETRIES, _mark_chunk_job_failed
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        chunk = await _create_chunk(
+            db_session, file.id, 0, status="pending",
+            retry_count=_MAX_CHUNK_AUTO_RETRIES,
+        )
+
+        await _mark_chunk_job_failed(
+            file.id, "translate_chunk", {"chunk_index": 0},
+            "OPENAI_API_ERROR", "Connection timeout",
+        )
+
+        await db_session.refresh(chunk)
+        assert chunk.status == "job_failed"
+
+    @pytest.mark.asyncio
+    async def test_terminal_error_sets_job_failed_immediately(
+        self, db_session, enqueue_mock
+    ):
+        from app.jobs.manager import _mark_chunk_job_failed
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        chunk = await _create_chunk(db_session, file.id, 0, status="pending")
+
+        await _mark_chunk_job_failed(
+            file.id, "translate_chunk", {"chunk_index": 0},
+            "NO_TARGET_EVENTS", "No dialogue events found",
+        )
+
+        await db_session.refresh(chunk)
+        assert chunk.status == "job_failed"
+        assert chunk.retry_count == 1
 
     @pytest.mark.asyncio
     async def test_stale_queue_entry_does_not_reclassify_completed_job(
@@ -1271,3 +1869,191 @@ class TestRetryEndpoint:
         await db_session.refresh(file)
         assert file.status == "processing"
         assert file.blocking_reason is None
+
+
+# ===========================================================================
+# Context gate endpoints (approve-context / translate / context retry)
+# ===========================================================================
+
+class TestContextGateEndpoints:
+    async def _ready_for_review_project(self, db_session):
+        """Project whose derived context state is ready_for_review."""
+        project = await _create_project(
+            db_session, status="context_review",
+            speaker_mapping_status="complete", context_approved=False,
+        )
+        file = await _create_file(db_session, project.id, status="ready",
+                                  subtitle_track_index=1, translation_requested=False)
+        await _create_subtitle(db_session, file.id)
+        await _create_style_bible(db_session, project.id)
+        return project, file
+
+    @pytest.mark.asyncio
+    async def test_context_status_states(self, db_session, enqueue_mock):
+        from app.orchestrator.context_status import compute_context_status
+
+        project, file = await self._ready_for_review_project(db_session)
+        status = await compute_context_status(project.id)
+        assert status["state"] == "ready_for_review"
+
+        # Building: mapping not complete yet
+        project2 = await _create_project(db_session, status="discovering",
+                                         speaker_mapping_status="aggregated",
+                                         context_approved=False,
+                                         source_directory="test2")
+        file2 = await _create_file(db_session, project2.id, status="ready",
+                                   subtitle_track_index=1, translation_requested=False)
+        await _create_subtitle(db_session, file2.id)
+        status2 = await compute_context_status(project2.id)
+        assert status2["state"] == "building"
+
+    @pytest.mark.asyncio
+    async def test_approve_context_sets_processing(self, db_session, enqueue_mock):
+        import unittest.mock as mock
+        from app.api.routes.projects import approve_context
+
+        project, file = await self._ready_for_review_project(db_session)
+
+        with mock.patch("app.api.routes.projects.orchestrate_project") as mock_orchestrate:
+            result = await approve_context(project.id)
+
+        assert result.status == "processing"
+        assert result.context_approved_at is not None
+        mock_orchestrate.assert_called_once()
+
+        # Idempotent second call
+        with mock.patch("app.api.routes.projects.orchestrate_project") as mock_orchestrate:
+            result2 = await approve_context(project.id)
+        assert result2.context_approved_at == result.context_approved_at
+        mock_orchestrate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_approve_context_409_while_building_or_failed(self, db_session, enqueue_mock):
+        from fastapi import HTTPException
+        from app.api.routes.projects import approve_context
+
+        project = await _create_project(db_session, status="discovering",
+                                        speaker_mapping_status="aggregated",
+                                        context_approved=False)
+        file = await _create_file(db_session, project.id, status="ready",
+                                  subtitle_track_index=1, translation_requested=False)
+        await _create_subtitle(db_session, file.id)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await approve_context(project.id)
+        assert exc_info.value.status_code == 409
+
+        await _create_job(db_session, project.id, "infer_character_mapping",
+                          f"infer_character_mapping:{project.id}", status="failed")
+        with pytest.raises(HTTPException) as exc_info:
+            await approve_context(project.id)
+        assert exc_info.value.status_code == 409
+        assert "character_mapping" in exc_info.value.detail["failed_components"]
+
+    @pytest.mark.asyncio
+    async def test_translate_file_sets_flag_and_orchestrates(self, db_session, enqueue_mock):
+        import unittest.mock as mock
+        from app.api.routes.projects import translate_file
+
+        project, file = await self._ready_for_review_project(db_session)
+        # Approve first
+        project_row = await db_session.get(Project, project.id)
+        project_row.context_approved_at = datetime.utcnow().isoformat()
+        project_row.status = "processing"
+        await db_session.commit()
+
+        with mock.patch("app.api.routes.projects.orchestrate_file") as mock_orchestrate, \
+             mock.patch("app.api.routes.projects.job_manager") as mock_manager:
+            mock_manager.enqueue = mock.AsyncMock()
+            result = await translate_file(project.id, file.id)
+
+        assert result.translation_requested_at is not None
+        mock_orchestrate.assert_called_once()
+        mock_manager.enqueue.assert_not_called()  # no analysis retry needed
+
+        # Idempotent second call keeps the original timestamp
+        with mock.patch("app.api.routes.projects.orchestrate_file"), \
+             mock.patch("app.api.routes.projects.job_manager") as mock_manager:
+            mock_manager.enqueue = mock.AsyncMock()
+            result2 = await translate_file(project.id, file.id)
+        assert result2.translation_requested_at == result.translation_requested_at
+
+    @pytest.mark.asyncio
+    async def test_translate_file_409_without_approval(self, db_session, enqueue_mock):
+        from fastapi import HTTPException
+        from app.api.routes.projects import translate_file
+
+        project, file = await self._ready_for_review_project(db_session)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await translate_file(project.id, file.id)
+        assert exc_info.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_translate_file_retries_failed_analysis(self, db_session, enqueue_mock):
+        import unittest.mock as mock
+        from app.api.routes.projects import translate_file
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="waiting",
+                                  blocking_reason="analysis_failed")
+        await _create_job(db_session, project.id, "analyze_script",
+                          f"analyze_script:{file.id}", status="failed", file_id=file.id)
+
+        with mock.patch("app.api.routes.projects.orchestrate_file"), \
+             mock.patch("app.api.routes.projects.job_manager") as mock_manager:
+            mock_manager.enqueue = mock.AsyncMock()
+            result = await translate_file(project.id, file.id)
+
+        assert result.status == "ready"
+        assert result.blocking_reason is None
+        enqueued = mock_manager.enqueue.call_args.kwargs
+        assert enqueued["job_type"] == "analyze_script"
+        assert enqueued["dedupe_key"] == f"analyze_script:{file.id}"
+
+    @pytest.mark.asyncio
+    async def test_translate_file_409_from_other_states(self, db_session, enqueue_mock):
+        from fastapi import HTTPException
+        from app.api.routes.projects import translate_file
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="discovering",
+                                  translation_requested=False)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await translate_file(project.id, file.id)
+        assert exc_info.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_context_retry_requeues_failed_component(self, db_session, enqueue_mock):
+        import unittest.mock as mock
+        from app.api.routes.projects import ContextRetryIn, retry_context_component
+
+        project = await _create_project(db_session, status="discovering",
+                                        speaker_mapping_status="aggregated",
+                                        context_approved=False)
+        await _create_job(db_session, project.id, "infer_character_mapping",
+                          f"infer_character_mapping:{project.id}", status="failed")
+
+        with mock.patch("app.api.routes.projects.job_manager") as mock_manager:
+            mock_manager.enqueue = mock.AsyncMock()
+            result = await retry_context_component(
+                project.id, ContextRetryIn(component="character_mapping"))
+
+        assert result["status"] == "requeued"
+        enqueued = mock_manager.enqueue.call_args.kwargs
+        assert enqueued["job_type"] == "infer_character_mapping"
+        assert enqueued["dedupe_key"] == f"infer_character_mapping:{project.id}"
+
+    @pytest.mark.asyncio
+    async def test_context_retry_409_when_not_failed(self, db_session, enqueue_mock):
+        from fastapi import HTTPException
+        from app.api.routes.projects import ContextRetryIn, retry_context_component
+
+        project = await _create_project(db_session, status="discovering",
+                                        context_approved=False)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await retry_context_component(
+                project.id, ContextRetryIn(component="character_mapping"))
+        assert exc_info.value.status_code == 409

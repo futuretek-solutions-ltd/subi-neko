@@ -10,3 +10,4 @@ python-multipart==0.0.20
 pysubs2==1.7.3
 openai==1.78.0
 httpx==0.28.1
+rapidfuzz==3.13.0

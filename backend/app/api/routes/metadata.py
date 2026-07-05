@@ -13,6 +13,7 @@ class SearchResultOut(BaseModel):
     title_native: str | None
     year: int | None
     media_type: MediaType
+    episode_count: int | None = None
 
 
 class SeriesDetailsOut(BaseModel):
@@ -60,6 +61,7 @@ async def search(
             title_native=r.title_native,
             year=r.year,
             media_type=r.media_type,
+            episode_count=r.episode_count,
         )
         for r in results
     ]

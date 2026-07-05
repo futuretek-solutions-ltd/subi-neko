@@ -30,6 +30,49 @@ def _effective_chunk_size(total_lines: int, configured_chunk_size: int) -> int:
     return ceil(total_lines / (chunk_count - 1))
 
 
+# Partition order is deterministic so chunk_index stays stable across
+# regenerations of the same file's chunk plan.
+_CONTENT_TYPE_PARTITIONS = ["dialogue", "sign", "karaoke", "song"]
+
+
+def _build_chunks_for_partition(
+    file_id: int,
+    content_type: str,
+    lines: list[int],
+    configured_chunk_size: int,
+    start_chunk_index: int,
+    now: str,
+) -> list[dict]:
+    chunk_rows: list[dict] = []
+    total = len(lines)
+    chunk_size = _effective_chunk_size(total, configured_chunk_size)
+
+    for offset, start_pos in enumerate(range(0, total, chunk_size)):
+        chunk_lines = lines[start_pos: start_pos + chunk_size]
+
+        translate_from_line = chunk_lines[0]
+        translate_to_line = chunk_lines[-1]
+
+        # Context is computed at runtime by translate_chunk (chronological,
+        # cross-partition, with prior translations) — the context_prepend_*
+        # columns are deprecated and no longer populated.
+        chunk_rows.append(dict(
+            file_id=file_id,
+            chunk_index=start_chunk_index + offset,
+            translate_from_line=translate_from_line,
+            translate_to_line=translate_to_line,
+            context_prepend_from_line=None,
+            context_prepend_to_line=None,
+            content_type=content_type,
+            status="pending",
+            model=None,
+            created_at=now,
+            updated_at=now,
+        ))
+
+    return chunk_rows
+
+
 @register_job_handler("plan_translation_chunks")
 def plan_translation_chunks(
     payload: dict[str, Any],
@@ -40,7 +83,6 @@ def plan_translation_chunks(
     now = datetime.utcnow().isoformat()
 
     chunk_size = ctx.options.chunk_size
-    prepend_context_size = ctx.options.prepend_context_size
 
     progress(0.05, "Loading dialogue events")
 
@@ -51,52 +93,36 @@ def plan_translation_chunks(
                              error_code="FILE_NOT_FOUND",
                              error_message=f"File id={file_id} not found")
 
-        # All Dialogue events in line order — only their line_index values needed
-        dialogue_lines: list[int] = list(session.scalars(
-            select(SubtitleEvent.line_index)
+        # All Dialogue-type events in line order, with their content_type classification
+        rows = session.execute(
+            select(SubtitleEvent.line_index, SubtitleEvent.content_type)
             .where(SubtitleEvent.file_id == file_id)
             .where(SubtitleEvent.event_type == "dialogue")
             .order_by(SubtitleEvent.line_index)
-        ).all())
+        ).all()
 
-    if not dialogue_lines:
+    if not rows:
         return JobResult(status="succeeded", result={"chunks_created": 0},
                          error_code=None, error_message=None)
 
-    progress(0.3, f"Building chunks from {len(dialogue_lines)} dialogue events")
+    progress(0.3, f"Building chunks from {len(rows)} dialogue-type events")
 
-    # Group into contiguous chunks of chunk_size
+    lines_by_content_type: dict[str, list[int]] = {ct: [] for ct in _CONTENT_TYPE_PARTITIONS}
+    for line_index, content_type in rows:
+        lines_by_content_type.setdefault(content_type, []).append(line_index)
+
     chunk_rows: list[dict] = []
-    total = len(dialogue_lines)
-    chunk_size = _effective_chunk_size(total, chunk_size)
-
-    for chunk_index, start_pos in enumerate(range(0, total, chunk_size)):
-        chunk_lines = dialogue_lines[start_pos: start_pos + chunk_size]
-
-        translate_from_line = chunk_lines[0]
-        translate_to_line = chunk_lines[-1]
-
-        # Context: up to prepend_context_size Dialogue lines immediately before this chunk
-        context_lines = dialogue_lines[max(0, start_pos - prepend_context_size): start_pos]
-        if context_lines:
-            context_prepend_from_line = context_lines[0]
-            context_prepend_to_line = context_lines[-1]
-        else:
-            context_prepend_from_line = None
-            context_prepend_to_line = None
-
-        chunk_rows.append(dict(
-            file_id=file_id,
-            chunk_index=chunk_index,
-            translate_from_line=translate_from_line,
-            translate_to_line=translate_to_line,
-            context_prepend_from_line=context_prepend_from_line,
-            context_prepend_to_line=context_prepend_to_line,
-            status="pending",
-            model=None,
-            created_at=now,
-            updated_at=now,
-        ))
+    next_chunk_index = 0
+    for content_type in _CONTENT_TYPE_PARTITIONS:
+        lines = lines_by_content_type.get(content_type) or []
+        if not lines:
+            continue
+        partition_chunks = _build_chunks_for_partition(
+            file_id, content_type, lines, chunk_size,
+            next_chunk_index, now,
+        )
+        chunk_rows.extend(partition_chunks)
+        next_chunk_index += len(partition_chunks)
 
     progress(0.7, f"Writing {len(chunk_rows)} chunks")
 

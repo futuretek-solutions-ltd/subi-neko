@@ -451,6 +451,8 @@ class JobManager:
                     _file_id, _job_type, payload,
                     _chunk_error_code, _chunk_error_message,
                 )
+            elif _final_status == JobStatus.COMPLETED.value and _file_id is not None:
+                await _clear_chunk_retry_state(_file_id, _job_type, payload)
 
             # Trigger orchestration after job completes
             if self._on_complete:
@@ -542,19 +544,30 @@ _CHUNK_JOB_TYPES = {
     "translate_chunk",
     "validate_chunk",
     "repair_chunk",
-    "review_chunk_rules",
-    "review_chunk_grammar",
-    "review_chunk_llm",
+    "polish_chunk",
+    "review_chunk_final",
 }
 
 _FAILED_JOB_ALLOWED_CHUNK_STATUSES = {
     "translate_chunk": {"pending"},
     "validate_chunk": {"translated"},
     "repair_chunk": {"validate_trans_failed"},
-    "review_chunk_rules": {"validated"},
-    "review_chunk_grammar": {"rules_reviewed"},
-    "review_chunk_llm": {"grammar_reviewed", "languagetool_reviewed"},
+    "polish_chunk": {"validated", "needs_polish"},
+    "review_chunk_final": {"polished"},
 }
+
+# Error codes worth an automatic re-run of the same chunk stage: the LLM
+# client already retried transient API noise in-call, but an exhausted retry
+# budget or a still-unparseable response can succeed on a fresh attempt.
+_RETRYABLE_CHUNK_ERROR_CODES = {
+    "OPENAI_API_ERROR",
+    "RESPONSE_PARSE_ERROR",
+    "UNEXPECTED_ERROR",
+}
+
+# Automatic re-runs per chunk before the failure becomes terminal
+# (job_failed) and requires a manual retry.
+_MAX_CHUNK_AUTO_RETRIES = 3
 
 
 async def _mark_chunk_job_failed(
@@ -564,11 +577,13 @@ async def _mark_chunk_job_failed(
     error_code: str | None,
     error_message: str | None,
 ) -> None:
-    """Set chunk status to job_failed after a technical job failure.
+    """Handle a technical chunk-job failure.
 
-    Only acts on chunk-level job types. Updates retry_count, error fields,
-    and failed_job_type so the orchestrator knows to stop and the UI can
-    show the error.
+    Retryable errors (API/parse) burn one unit of the chunk's auto-retry
+    budget and leave the chunk status untouched — the orchestrator then
+    re-enqueues the same stage. Terminal errors, or an exhausted budget,
+    set status job_failed so the orchestrator stops and the UI surfaces
+    the error for manual retry.
     """
     if job_type not in _CHUNK_JOB_TYPES:
         return
@@ -595,19 +610,60 @@ async def _mark_chunk_job_failed(
                     file_id, chunk_index, job_type, chunk.status,
                 )
                 return
-            chunk.status = "job_failed"
-            chunk.retry_count = (chunk.retry_count or 0) + 1
+
+            retryable = (
+                error_code in _RETRYABLE_CHUNK_ERROR_CODES
+                and (chunk.retry_count or 0) < _MAX_CHUNK_AUTO_RETRIES
+            )
+            new_retry_count = (chunk.retry_count or 0) + 1
+            chunk.retry_count = new_retry_count
             chunk.failed_job_type = job_type
             chunk.last_error_code = error_code
             chunk.last_error_message = error_message
             chunk.updated_at = now
+            if not retryable:
+                chunk.status = "job_failed"
             await session.commit()
-        logger.warning(
-            "Chunk file_id=%d index=%d → job_failed (job_type=%s, error=%s)",
-            file_id, chunk_index, job_type, error_code,
-        )
+
+        if retryable:
+            logger.warning(
+                "Chunk file_id=%d index=%d %s failed with %s — auto-retry %d/%d",
+                file_id, chunk_index, job_type, error_code,
+                new_retry_count, _MAX_CHUNK_AUTO_RETRIES,
+            )
+        else:
+            logger.warning(
+                "Chunk file_id=%d index=%d → job_failed (job_type=%s, error=%s)",
+                file_id, chunk_index, job_type, error_code,
+            )
     except Exception:
         logger.exception(
             "Failed to mark chunk file_id=%d index=%d as job_failed",
+            file_id, chunk_index,
+        )
+
+
+async def _clear_chunk_retry_state(file_id: int, job_type: str, payload: dict) -> None:
+    """A chunk stage succeeded — reset the auto-retry budget so each stage
+    gets the full allowance."""
+    if job_type not in _CHUNK_JOB_TYPES:
+        return
+    chunk_index = payload.get("chunk_index")
+    if not isinstance(chunk_index, int):
+        return
+    try:
+        async with AsyncSessionLocal() as session:
+            chunk = await session.scalar(
+                select(SubtitleChunk)
+                .where(SubtitleChunk.file_id == file_id)
+                .where(SubtitleChunk.chunk_index == chunk_index)
+            )
+            if chunk is not None and (chunk.retry_count or 0) > 0:
+                chunk.retry_count = 0
+                chunk.updated_at = datetime.utcnow().isoformat()
+                await session.commit()
+    except Exception:
+        logger.exception(
+            "Failed to clear retry state for chunk file_id=%d index=%d",
             file_id, chunk_index,
         )

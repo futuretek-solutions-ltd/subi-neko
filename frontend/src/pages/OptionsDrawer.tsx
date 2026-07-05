@@ -298,48 +298,60 @@ function OptionsForm({ options }: { options: OptionsMap }) {
         <SaveOnBlurText
           optionKey="OPENAI_MODEL_BETTER"
           label="Better model"
-          description="Used for repair and LLM review jobs where quality is critical."
+          description="Used for the polish and repair passes where quality is critical."
           defaultValue={options['OPENAI_MODEL_BETTER'] ?? null}
         />
-      </Section>
-
-      <Divider />
-
-      <Section title="Grammar">
         <SaveOnChangeSelect
-          optionKey="GRAMMAR_PROVIDER"
-          label="Grammar provider"
-          description="Grammar and spellcheck provider used during chunk review."
-          defaultValue={options['GRAMMAR_PROVIDER'] ?? 'languagetool'}
+          optionKey="LLM_STRUCTURED_OUTPUTS"
+          label="Structured outputs"
+          description="How LLM responses are constrained. Auto probes the backend and falls back automatically (json_schema → json_object → text)."
+          defaultValue={options['LLM_STRUCTURED_OUTPUTS'] ?? 'auto'}
           data={[
-            { value: 'languagetool', label: 'LanguageTool' },
-            { value: 'korektor', label: 'Korektor' },
-            { value: 'none', label: 'None (skip grammar check)' },
+            { value: 'auto', label: 'Auto (recommended)' },
+            { value: 'json_schema', label: 'JSON schema (strict)' },
+            { value: 'json_object', label: 'JSON object' },
+            { value: 'text', label: 'Free text' },
           ]}
         />
         <SaveOnBlurText
-          optionKey="GRAMMAR_PROVIDER_BASE_URL"
-          label="Grammar provider URL"
-          description="REST endpoint of the selected grammar provider. Not used when provider is set to None."
-          defaultValue={options['GRAMMAR_PROVIDER_BASE_URL'] ?? null}
-          placeholder="http://localhost:8010"
+          optionKey="LLM_PRICES_JSON"
+          label="Model prices (JSON)"
+          description={'Per-million-token prices for cost tracking, e.g. {"gpt-5.4-mini": {"in": 0.4, "out": 1.6}}. Leave blank to skip cost accounting.'}
+          defaultValue={options['LLM_PRICES_JSON'] ?? null}
+          placeholder='{"gpt-5.4-mini": {"in": 0.4, "out": 1.6}}'
         />
       </Section>
 
       <Divider />
 
-      <Section title="LLM Review">
+      <Section title="Quality">
         <SaveOnChangeSwitch
-          optionKey="LLM_REVIEW_ALWAYS"
-          label="Always run LLM review"
-          description="Run LLM review on every chunk regardless of rules review results. When off, LLM review only runs on chunks where it was flagged as needed."
-          defaultValue={options['LLM_REVIEW_ALWAYS'] ?? '0'}
+          optionKey="TRANSLATE_KARAOKE"
+          label="Translate karaoke lines"
+          description="Off (recommended): karaoke lines with per-syllable \\k timing are kept in the original language so the timing survives. On: they are translated and the syllable timing is lost."
+          defaultValue={options['TRANSLATE_KARAOKE'] ?? '0'}
+        />
+        <SaveOnBlurNumber
+          optionKey="CPS_LIMIT"
+          label="Reading speed limit (CPS)"
+          description="Characters per second above which a line is flagged for condensing."
+          defaultValue={options['CPS_LIMIT'] ?? null}
+          min={5}
+          max={40}
+        />
+        <SaveOnBlurNumber
+          optionKey="MAX_ROW_CHARS"
+          label="Max characters per row"
+          description="Row length above which a line is flagged for rewrapping or condensing."
+          defaultValue={options['MAX_ROW_CHARS'] ?? null}
+          min={20}
+          max={80}
         />
         <SaveOnChangeSwitch
-          optionKey="LLM_REVIEW_FLAGGED_ONLY"
-          label="Review only flagged events"
-          description="Send only events with existing QA issues to the LLM. When off, the entire chunk is sent for review."
-          defaultValue={options['LLM_REVIEW_FLAGGED_ONLY'] ?? '1'}
+          optionKey="AUTO_LINE_BREAK"
+          label="Auto line breaks"
+          description="On (recommended): dialogue rows longer than the row limit are automatically rebalanced onto two lines at a word boundary; only lines that still don't fit are flagged. Off: long rows are flagged for manual rewrapping."
+          defaultValue={options['AUTO_LINE_BREAK'] ?? '1'}
         />
       </Section>
 
@@ -357,7 +369,7 @@ function OptionsForm({ options }: { options: OptionsMap }) {
         <SaveOnBlurNumber
           optionKey="PREPEND_CONTEXT_SIZE"
           label="Context lines"
-          description="Lines from the previous chunk prepended for context. Helps the model maintain consistency at chunk boundaries."
+          description="Rolling context window: how many preceding subtitle lines (with their finished translations) each chunk sees. Translation is serialized per file so this context is usually already translated."
           defaultValue={options['PREPEND_CONTEXT_SIZE'] ?? null}
           min={0}
           max={50}
@@ -400,16 +412,30 @@ function OptionsForm({ options }: { options: OptionsMap }) {
         <SaveOnBlurTextarea
           optionKey="REPAIR_PROMPT"
           label="Repair prompt"
-          description="Instructs the model how to fix translation errors flagged by validation or review."
+          description="Instructs the model how to fix translation errors flagged by validation."
           defaultValue={options['REPAIR_PROMPT'] ?? null}
           onReset={() => resetPrompt('REPAIR_PROMPT')}
         />
         <SaveOnBlurTextarea
-          optionKey="REVIEW_PROMPT"
-          label="LLM review prompt"
-          description="Instructs the model how to review translated chunks for quality issues."
-          defaultValue={options['REVIEW_PROMPT'] ?? null}
-          onReset={() => resetPrompt('REVIEW_PROMPT')}
+          optionKey="POLISH_PROMPT"
+          label="Polish prompt"
+          description="Instructs the model how to rework draft translations into natural, fluent target-language subtitles."
+          defaultValue={options['POLISH_PROMPT'] ?? null}
+          onReset={() => resetPrompt('POLISH_PROMPT')}
+        />
+        <SaveOnBlurTextarea
+          optionKey="SIGN_TRANSLATION_PROMPT"
+          label="Sign translation prompt"
+          description="Used for on-screen text (signs, captions, typesetting) instead of the dialogue prompt."
+          defaultValue={options['SIGN_TRANSLATION_PROMPT'] ?? null}
+          onReset={() => resetPrompt('SIGN_TRANSLATION_PROMPT')}
+        />
+        <SaveOnBlurTextarea
+          optionKey="SONG_TRANSLATION_PROMPT"
+          label="Song translation prompt"
+          description="Used for song lyrics (OP/ED/insert songs) instead of the dialogue prompt."
+          defaultValue={options['SONG_TRANSLATION_PROMPT'] ?? null}
+          onReset={() => resetPrompt('SONG_TRANSLATION_PROMPT')}
         />
       </Section>
     </Stack>

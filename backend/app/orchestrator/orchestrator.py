@@ -21,7 +21,7 @@ EnqueueFn = Callable[..., Awaitable[Any]]
 _ACTIVE_PROJECT_STATUSES = frozenset({
     ProjectStatus.NEW.value,
     ProjectStatus.DISCOVERING.value,
-    ProjectStatus.WAITING_FOR_MAPPING.value,
+    ProjectStatus.CONTEXT_REVIEW.value,
     ProjectStatus.PROCESSING.value,
     ProjectStatus.REVIEW_REQUIRED.value,
 })

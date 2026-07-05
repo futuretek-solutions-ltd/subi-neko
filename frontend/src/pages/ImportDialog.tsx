@@ -30,6 +30,17 @@ function normalizeDirName(name: string): string {
   return name.replace(/[-_.]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// "OVA, 12 episodes" — whichever parts the provider knows (AniDB search
+// results carry neither, AniList carries both).
+function showTypeLabel(result: SearchResult): string {
+  const parts: string[] = [];
+  if (result.media_type && result.media_type !== 'Unknown') parts.push(result.media_type);
+  if (result.episode_count) {
+    parts.push(`${result.episode_count} episode${result.episode_count === 1 ? '' : 's'}`);
+  }
+  return parts.join(', ');
+}
+
 interface ImportDialogProps {
   opened: boolean;
   onClose: () => void;
@@ -39,7 +50,7 @@ export function ImportDialog({ opened, onClose }: ImportDialogProps) {
   const queryClient = useQueryClient();
 
   const [selectedDir, setSelectedDir] = useState<string | null>(null);
-  const [provider, setProvider] = useState<'anilist' | 'anidb'>('anilist');
+  const [provider, setProvider] = useState<'anilist' | 'anidb'>('anidb');
   const [searchQuery, setSearchQuery] = useState('');
   const [committedQuery, setCommittedQuery] = useState('');
   const [selectedResult, setSelectedResult] = useState<SearchResult | null>(null);
@@ -198,8 +209,8 @@ export function ImportDialog({ opened, onClose }: ImportDialogProps) {
                 value={provider}
                 onChange={(v) => setProvider(v as 'anilist' | 'anidb')}
                 data={[
-                  { label: 'AniList', value: 'anilist' },
                   { label: 'AniDB', value: 'anidb' },
+                  { label: 'AniList', value: 'anilist' },
                 ]}
               />
 
@@ -266,17 +277,17 @@ export function ImportDialog({ opened, onClose }: ImportDialogProps) {
                                     {result.title_native}
                                   </Text>
                                 )}
-                              </Box>
-                              <Group gap={4} style={{ flexShrink: 0 }}>
-                                {result.year && (
-                                  <Badge size="xs" variant="light" color="gray">
-                                    {result.year}
-                                  </Badge>
+                                {showTypeLabel(result) && (
+                                  <Text size="xs" c="dimmed">
+                                    {showTypeLabel(result)}
+                                  </Text>
                                 )}
-                                <Badge size="xs" variant="light" color="blue">
-                                  {result.media_type}
+                              </Box>
+                              {result.year && (
+                                <Badge size="xs" variant="light" color="gray" style={{ flexShrink: 0 }}>
+                                  {result.year}
                                 </Badge>
-                              </Group>
+                              )}
                             </Group>
                           </Card>
                         </UnstyledButton>

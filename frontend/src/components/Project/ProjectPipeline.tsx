@@ -1,8 +1,8 @@
-import { Box, Button, Group, Paper, Stack, Text } from '@mantine/core';
-import { CheckCircle, GitMerge, Hourglass, Play, Stop, Warning } from '@phosphor-icons/react';
+import { Box, Group, Paper, Stack, Text } from '@mantine/core';
+import { CheckCircle, Hourglass, Play, Stop, Warning } from '@phosphor-icons/react';
 import type { Project, VideoFile } from '../../types';
-import { useProjectCharacters } from '../../hooks/useCharacterMapping';
-import { useProjectStats } from '../../hooks/useProjects';
+import { useProjectSpeakers } from '../../hooks/useCharacterMapping';
+import { useContextStatus, useProjectStats } from '../../hooks/useProjects';
 
 // ─── State helpers ────────────────────────────────────────────────────────────
 
@@ -11,7 +11,7 @@ type StepState = 'waiting' | 'active' | 'needs_attention' | 'completed';
 const STATUS_RANK: Record<string, number> = {
   new: 0,
   discovering: 1,
-  waiting_for_mapping: 2,
+  context_review: 2,
   processing: 3,
   review_required: 4,
   completed: 5,
@@ -80,14 +80,14 @@ function StepBox({ title, state, detail }: StepBoxProps) {
 interface ProjectPipelineProps {
   project: Project;
   files: VideoFile[];
-  onMapCharacters: () => void;
 }
 
-export function ProjectPipeline({ project, files, onMapCharacters }: ProjectPipelineProps) {
+export function ProjectPipeline({ project, files }: ProjectPipelineProps) {
   const rank = STATUS_RANK[project.status] ?? 0;
 
-  const { data: characters = [] } = useProjectCharacters(project.id);
+  const { data: speakers = [] } = useProjectSpeakers(project.id);
   const { data: stats } = useProjectStats(project.id);
+  const { data: context } = useContextStatus(project.id);
 
   // Aggregate counts from files
   const filesTotal = files.length;
@@ -95,8 +95,6 @@ export function ProjectPipeline({ project, files, onMapCharacters }: ProjectPipe
   const filesCompleted = files.filter((f) => f.status === 'completed').length;
   const chunksTotal = files.reduce((s, f) => s + (f.chunks_total ?? 0), 0);
   const chunksDone = files.reduce((s, f) => s + (f.chunks_done ?? 0), 0);
-
-  const unmappedChars = characters.filter((c) => c.speaker_ids.length === 0).length;
 
   // ── Preparation ──────────────────────────────────────────────────────────
   const prepState: StepState =
@@ -108,24 +106,35 @@ export function ProjectPipeline({ project, files, onMapCharacters }: ProjectPipe
     </Text>
   );
 
-  // ── Characters ───────────────────────────────────────────────────────────
-  const charState: StepState =
-    rank >= 3 ? 'completed' : rank >= 2 ? 'needs_attention' : 'waiting';
+  // ── Context (gate 1 — built automatically, approved explicitly) ──────────
+  const mapped = speakers.filter((s) => !s.is_extra && s.character_id !== null);
+  const charCount = new Set(mapped.map((s) => s.character_id)).size;
+  const nonExtra = speakers.filter((s) => !s.is_extra).length;
 
-  const charDetail =
-    charState === 'needs_attention' ? (
-      <Button
-        size="xs"
-        variant="light"
-        color="pink"
-        leftSection={<GitMerge size={12} />}
-        onClick={onMapCharacters}
-        mt={2}
-      >
-        Map {unmappedChars > 0 ? unmappedChars : characters.length} characters
-      </Button>
-    ) : charState === 'completed' ? (
-      <Text size="xs" c="dimmed">{characters.length} characters mapped</Text>
+  const contextState: StepState =
+    context?.state === 'approved'
+      ? 'completed'
+      : context?.state === 'failed' || context?.state === 'ready_for_review'
+        ? 'needs_attention'
+        : rank >= 1 ? 'active' : 'waiting';
+
+  const failedComponents = (context?.components ?? [])
+    .filter((c) => c.status === 'failed')
+    .map((c) => c.key.replace(/_/g, ' '));
+
+  const contextDetail =
+    context?.state === 'approved' ? (
+      <Text size="xs" c="dimmed">
+        {speakers.length === 0
+          ? 'no speakers found'
+          : `${charCount} characters · ${mapped.length}/${nonExtra} speakers mapped`}
+      </Text>
+    ) : context?.state === 'failed' ? (
+      <Text size="xs" c="red">failed: {failedComponents.join(', ')}</Text>
+    ) : context?.state === 'ready_for_review' ? (
+      <Text size="xs" c="yellow">awaiting approval</Text>
+    ) : contextState === 'active' ? (
+      <Text size="xs" c="dimmed">building translation context…</Text>
     ) : (
       <Text size="xs" c="dimmed">—</Text>
     );
@@ -180,7 +189,7 @@ export function ProjectPipeline({ project, files, onMapCharacters }: ProjectPipe
   return (
     <Group gap="xs" align="stretch" wrap="nowrap">
       <StepBox title="Preparation" state={prepState} detail={prepDetail} />
-      <StepBox title="Characters" state={charState} detail={charDetail} />
+      <StepBox title="Context" state={contextState} detail={contextDetail} />
       <StepBox title="Translation" state={transState} detail={transDetail} />
       <StepBox title="Review" state={reviewState} detail={reviewDetail} />
       <StepBox title="Output" state={outputState} detail={outputDetail} />

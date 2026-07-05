@@ -3,7 +3,7 @@
 export type ProjectStatus =
   | 'new'
   | 'discovering'
-  | 'waiting_for_mapping'
+  | 'context_review'
   | 'processing'
   | 'review_required'
   | 'completed'
@@ -11,9 +11,8 @@ export type ProjectStatus =
 
 export type SpeakerMappingStatus =
   | 'awaiting_discovery'
-  | 'mapping_required'
-  | 'mapping_complete'
-  | 'no_speakers';
+  | 'aggregated'
+  | 'complete';
 
 export interface Project {
   id: number;
@@ -24,8 +23,67 @@ export interface Project {
   speaker_mapping_status: SpeakerMappingStatus;
   status: ProjectStatus;
   is_paused: boolean;
+  context_approved_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// ─── Translation context (gate 1) ────────────────────────────────────────────
+
+export type ContextState = 'building' | 'failed' | 'ready_for_review' | 'approved';
+
+export type ContextComponentStatus =
+  | 'pending'
+  | 'running'
+  | 'complete'
+  | 'failed'
+  | 'skipped'
+  | 'info';
+
+export type ContextComponentKey =
+  | 'discovery'
+  | 'speaker_aggregation'
+  | 'character_mapping'
+  | 'style_bible'
+  | 'glossary'
+  | 'address_pairs'
+  | 'character_styles';
+
+export interface ContextComponent {
+  key: ContextComponentKey;
+  status: ContextComponentStatus;
+  detail: Record<string, unknown>;
+  error_code?: string | null;
+  error_message?: string | null;
+  retryable?: boolean;
+}
+
+export interface ContextAttentionItem {
+  type: 'unmapped_speaker' | 'low_confidence_mapping' | 'empty_character_roster';
+  speaker_id?: number;
+  name?: string;
+  line_count?: number;
+  confidence?: number | null;
+  character_name?: string | null;
+  message?: string;
+}
+
+export interface ContextConfidence {
+  speakers_total: number;
+  non_extra: number;
+  unmapped_non_extra: number;
+  below_threshold: number;
+  threshold: number;
+  line_weighted_coverage: number | null;
+  overall: 'high' | 'medium' | 'low';
+}
+
+export interface ContextStatus {
+  state: ContextState;
+  approved_at: string | null;
+  components: ContextComponent[];
+  attention: ContextAttentionItem[];
+  confidence: ContextConfidence;
 }
 
 // ─── Files ────────────────────────────────────────────────────────────────────
@@ -43,10 +101,10 @@ export type FileStatus =
   | 'failed';
 
 export type FileBlockingReason =
-  | 'project_mapping_required'
   | 'user_review_required'
   | 'subtitle_missing'
   | 'subtitle_parse_failed'
+  | 'analysis_failed'
   | 'translation_failed'
   | 'validation_failed'
   | 'mux_failed'
@@ -57,6 +115,7 @@ export interface SubtitleChunk {
   chunk_index: number;
   translate_from_line: number;
   translate_to_line: number;
+  content_type: string;
   status: string;
   model: string | null;
   llm_review_needed: boolean;
@@ -102,6 +161,7 @@ export interface VideoFile {
   relative_path: string;
   status: FileStatus;
   blocking_reason: FileBlockingReason | null;
+  translation_requested_at: string | null;
   detected_subtitle_format: string | null;
   subtitle_track_index: number | null;
   retry_count: number;
@@ -123,6 +183,8 @@ export interface QaIssue {
   qa_type: string;
   message: string;
   details_json: string | null;
+  is_resolved: boolean;
+  resolution_note: string | null;
   created_at: string;
 }
 
@@ -164,17 +226,54 @@ export interface ProjectCharacterWithSpeakers extends ProjectCharacter {
   speaker_ids: number[];
 }
 
-export interface ProjectSpeakerWithCount extends ProjectSpeaker {
-  mapping_count: number;
-}
+export type MatchOrigin = 'manual' | 'fuzzy' | 'llm';
 
 export interface ProjectSpeaker {
   id: number;
   project_id: number;
   name: string;
   gender: string | null;
+  character_id: number | null;
+  character_name: string | null;
+  match_confidence: number | null;
+  match_origin: MatchOrigin | null;
+  match_rationale: string | null;
+  line_count: number;
+  sample_lines: string[];
+  is_extra: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface SpeakerUpdateResult {
+  speaker: ProjectSpeaker;
+  affected_chunk_count: number;
+}
+
+// ─── Review queue ────────────────────────────────────────────────────────────
+
+export type QaSeverity = 'blocker' | 'warning' | 'info';
+
+export interface ReviewQueueItem {
+  id: number;
+  file_id: number;
+  filename: string;
+  severity: QaSeverity;
+  qa_type: string;
+  message: string;
+  event_id: number | null;
+  line_index: number | null;
+  speaker: string | null;
+  source_text: string | null;
+  translated_text: string | null;
+  translation_confidence: number | null;
+  is_user_edited: boolean;
+  created_at: string;
+}
+
+export interface ReviewQueue {
+  total: number;
+  items: ReviewQueueItem[];
 }
 
 // ─── Project stats ────────────────────────────────────────────────────────────
@@ -238,6 +337,7 @@ export interface SearchResult {
   title_native: string | null;
   year: number | null;
   media_type: string;
+  episode_count: number | null;
 }
 
 // ─── Import ───────────────────────────────────────────────────────────────────

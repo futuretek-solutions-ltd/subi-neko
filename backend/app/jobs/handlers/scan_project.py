@@ -12,6 +12,7 @@ from app.core.database import SyncSessionLocal
 from app.db.models import File, Project
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.registry import register_job_handler
+from app.subs.episode_parsing import parse_episode_number
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ def scan_project(
                     project_id=project_id,
                     filename=mkv.name,
                     relative_path=relative_path,
+                    episode_number=parse_episode_number(mkv.name),
                     status="new",
                     created_at=now,
                     updated_at=now,

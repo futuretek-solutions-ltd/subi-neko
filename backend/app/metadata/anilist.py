@@ -28,6 +28,7 @@ query Search($q: String) {
       title { romaji english native }
       startDate { year }
       format
+      episodes
     }
   }
 }
@@ -188,6 +189,8 @@ class AniListProvider(MetadataProvider):
                     title_native=r["title_native"],
                     year=r["year"],
                     media_type=MediaType(r["media_type"]),
+                    # older cache entries predate this key
+                    episode_count=r.get("episode_count"),
                 )
                 for r in cached
             ]
@@ -212,6 +215,7 @@ class AniListProvider(MetadataProvider):
                 "title_native": native,
                 "year": year,
                 "media_type": media_type,
+                "episode_count": media.get("episodes"),
             })
 
         self._cache.set(cache_key, results, ttl=3600)
@@ -222,6 +226,7 @@ class AniListProvider(MetadataProvider):
                 title_native=r["title_native"],
                 year=r["year"],
                 media_type=MediaType(r["media_type"]),
+                episode_count=r.get("episode_count"),
             )
             for r in results
         ]

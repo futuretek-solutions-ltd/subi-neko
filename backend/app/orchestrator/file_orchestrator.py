@@ -1,6 +1,7 @@
 """File-level orchestrator — state machine for individual file processing."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Awaitable, Callable
@@ -9,13 +10,16 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.core.database import AsyncSessionLocal
+from app.db import options as options_store
 from app.db.models import (
     File,
+    FileAnalysis,
     FileBlockingReason,
     FileStatus,
     JobRecord,
     JobStatus,
     Project,
+    QaItem,
     Subtitle,
     SubtitleChunk,
     SubtitleEvent,
@@ -90,10 +94,6 @@ async def _handle_discovering(
             select(func.count()).select_from(Subtitle).where(Subtitle.file_id == file_id)
         ) > 0
 
-        # Re-read project for fresh mapping status
-        fresh_project = await session.get(Project, project.id)
-        mapping_status = fresh_project.speaker_mapping_status if fresh_project else project.speaker_mapping_status
-
     if not has_track:
         await _ensure_file_job(enqueue_fn, "inspect_mkv", file_id, project.id)
         return
@@ -102,20 +102,9 @@ async def _handle_discovering(
         await _ensure_file_job(enqueue_fn, "extract_subtitles", file_id, project.id)
         return
 
-    # Subtitles extracted — check mapping gate
-    if mapping_status not in ("mapping_complete", "no_speakers"):
-        if mapping_status == "awaiting_discovery":
-            # Let project orchestrator handle aggregate_speakers first
-            return
-        # Mapping not complete yet → file waits
-        await _set_file_status(
-            file_id,
-            FileStatus.WAITING.value,
-            FileBlockingReason.PROJECT_MAPPING_REQUIRED.value,
-        )
-        return
-
-    # Mapping complete → ready
+    # Subtitles extracted → ready. The file then waits for the project-level
+    # context approval and its own Translate action (see _handle_ready);
+    # speaker mapping is enforced by the project's context gate, not here.
     await _set_file_status(file_id, FileStatus.READY.value, None)
 
 
@@ -128,19 +117,9 @@ async def _handle_waiting(
             return
         blocking_reason = file.blocking_reason
 
-        # Re-read project for fresh mapping status
-        fresh_project = await session.get(Project, project.id)
-        mapping_status = fresh_project.speaker_mapping_status if fresh_project else project.speaker_mapping_status
-
-    if blocking_reason == FileBlockingReason.PROJECT_MAPPING_REQUIRED.value:
-        if mapping_status in ("mapping_complete", "no_speakers"):
-            await _set_file_status(file_id, FileStatus.READY.value, None)
-        # else: keep waiting
-        return
-
     # Partial-block: one or more chunks need user action but others may still
     # be progressing (e.g. chunk 3 is validate_repair_failed while chunk 0
-    # is rules_reviewed and waiting for the grammar job).  Keep scheduling
+    # is polished and waiting for its final review).  Keep scheduling
     # work for the non-blocked chunks so the pipeline doesn't stall.
     if blocking_reason in (
         FileBlockingReason.TRANSLATION_FAILED.value,
@@ -152,11 +131,24 @@ async def _handle_waiting(
 
     # All other blocking reasons: wait for user/manual action
     # (user_review_required, subtitle_missing, subtitle_parse_failed,
+    #  analysis_failed — retried via the file's Translate action —,
     #  mux_failed, paused)
 
 
 async def _handle_ready(file_id: int, project_id: int, enqueue_fn: EnqueueFn) -> None:
     async with AsyncSessionLocal() as session:
+        file = await session.get(File, file_id)
+        project = await session.get(Project, project_id)
+        if file is None or project is None:
+            return
+
+        # Both quality gates must be open before any work starts: the
+        # project's translation context approved, and this file's Translate
+        # action clicked. Until then the file is inert (endpoints guard this
+        # too — this keeps the sweep from starting anything on its own).
+        if project.context_approved_at is None or file.translation_requested_at is None:
+            return
+
         # Check fonts
         unchecked_fonts = await session.scalar(
             select(func.count())
@@ -174,6 +166,12 @@ async def _handle_ready(file_id: int, project_id: int, enqueue_fn: EnqueueFn) ->
             .where(SubtitleChunk.file_id == file_id)
         )
 
+        has_analysis = await session.scalar(
+            select(func.count())
+            .select_from(FileAnalysis)
+            .where(FileAnalysis.file_id == file_id)
+        ) > 0
+
     if unchecked_fonts > 0:
         await _ensure_file_job(enqueue_fn, "resolve_style_fonts", file_id, project_id)
         return
@@ -182,8 +180,40 @@ async def _handle_ready(file_id: int, project_id: int, enqueue_fn: EnqueueFn) ->
         await _ensure_file_job(enqueue_fn, "plan_translation_chunks", file_id, project_id)
         return
 
-    # Both prerequisites met → processing
+    # Script analysis gate (per file) — hard: translation never starts
+    # without the analysis context. A permanently failed job parks the file
+    # for the user, who retries via the Translate action.
+    if not has_analysis:
+        dedupe_key = f"analyze_script:{file_id}"
+        if await _job_failed_permanently(dedupe_key):
+            await _set_file_status(
+                file_id,
+                FileStatus.WAITING.value,
+                FileBlockingReason.ANALYSIS_FAILED.value,
+            )
+            return
+        await enqueue_fn(
+            job_type="analyze_script",
+            project_id=project_id,
+            payload={"file_id": file_id},
+            file_id=file_id,
+            dedupe_key=dedupe_key,
+        )
+        return
+
+    # All prerequisites met → processing
     await _set_file_status(file_id, FileStatus.PROCESSING.value, None)
+
+
+async def _job_failed_permanently(dedupe_key: str) -> bool:
+    """True when the job behind dedupe_key has run and failed — used by the
+    soft gates above so a broken LLM/config can't wedge files in READY (the
+    orchestrator would otherwise re-enqueue the failed job every sweep)."""
+    async with AsyncSessionLocal() as session:
+        status = await session.scalar(
+            select(JobRecord.status).where(JobRecord.dedupe_key == dedupe_key)
+        )
+    return status == JobStatus.FAILED.value
 
 
 async def _handle_processing(
@@ -207,13 +237,66 @@ async def _handle_chunks_result(
     if not all_complete:
         return
 
-    # All chunks complete. Muxing must be explicitly accepted by the user,
-    # even when there are no unresolved QA items.
+    # All chunks complete — risk-based acceptance:
+    #   fully_clean (default): auto-mux when zero unresolved QA items of ANY
+    #                          severity remain; anything flagged → human review
+    #   no_blockers:           auto-mux unless a blocker-severity item remains
+    #   manual:                always require an explicit accept
+    policy = (await options_store.aget("AUTO_ACCEPT_POLICY", "fully_clean") or "fully_clean").strip().lower()
+    if policy in ("fully_clean", "no_blockers"):
+        async with AsyncSessionLocal() as session:
+            query = (
+                select(func.count())
+                .select_from(QaItem)
+                .where(QaItem.file_id == file_id, QaItem.is_resolved == 0)
+            )
+            if policy == "no_blockers":
+                query = query.where(QaItem.severity == "blocker")
+            unresolved = await session.scalar(query)
+        if unresolved == 0:
+            logger.info("File id=%d clean under policy '%s' — auto-accepting", file_id, policy)
+            await finalize_accepted_file(file_id, project_id, enqueue_fn)
+            return
+
     await _set_file_status(
         file_id,
         FileStatus.REVIEW_REQUIRED.value,
         FileBlockingReason.USER_REVIEW_REQUIRED.value,
     )
+
+
+async def finalize_accepted_file(file_id: int, project_id: int, enqueue_fn: EnqueueFn) -> None:
+    """Shared acceptance path (auto-accept and the accept endpoint): the
+    translations are final — feed them into the translation memory, let the
+    style bible learn from the episode, and transition to muxing. TM/bible
+    steps are best-effort and never block the acceptance."""
+    try:
+        written = await asyncio.to_thread(_populate_translation_memory_sync, project_id, file_id)
+        logger.info("TM populated from file %d: %d entries", file_id, written)
+    except Exception:
+        logger.exception("Translation memory population failed for file %d", file_id)
+    try:
+        await enqueue_fn(
+            job_type="update_style_bible",
+            project_id=project_id,
+            payload={"project_id": project_id, "file_id": file_id},
+            file_id=file_id,
+            dedupe_key=f"update_style_bible:{project_id}:{file_id}",
+        )
+    except Exception:
+        logger.exception("Failed to enqueue style bible update for file %d", file_id)
+
+    await _set_file_status(file_id, FileStatus.MUXING.value, None)
+
+
+def _populate_translation_memory_sync(project_id: int, file_id: int) -> int:
+    from app.core.database import SyncSessionLocal
+    from app.subs import translation_memory as tm
+
+    with SyncSessionLocal() as session:
+        written = tm.populate_from_file(session, project_id, file_id)
+        session.commit()
+    return written
 
 
 async def _handle_review_required(

@@ -1,6 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import client from '../api/client';
-import type { Project, ProjectStats, ProjectWatchedWord, SubtitleChunk, VideoFile, WatchedWordType } from '../types';
+import type {
+  ContextStatus,
+  Project,
+  ProjectStats,
+  ProjectWatchedWord,
+  SubtitleChunk,
+  VideoFile,
+  WatchedWordType,
+} from '../types';
 
 export function useProjects() {
   return useQuery<Project[]>({
@@ -101,9 +109,10 @@ export function useRetryChunk(projectId: number, fileId: number) {
 export function useAcceptFileReview(projectId: number) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (fileId: number) => {
+    mutationFn: async ({ fileId, resolveWarnings = false }: { fileId: number; resolveWarnings?: boolean }) => {
       const { data } = await client.post<VideoFile>(
         `/projects/${projectId}/files/${fileId}/accept-review`,
+        { resolve_warnings: resolveWarnings },
       );
       return data;
     },
@@ -114,6 +123,61 @@ export function useAcceptFileReview(projectId: number) {
       );
       queryClient.invalidateQueries({ queryKey: ['projects'] });
       queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'files', data.id, 'chunks'] });
+    },
+  });
+}
+
+export function useContextStatus(projectId: number | null, enabled = true) {
+  return useQuery<ContextStatus>({
+    queryKey: ['projects', projectId, 'context'],
+    queryFn: async () => {
+      const { data } = await client.get<ContextStatus>(`/projects/${projectId}/context-status`);
+      return data;
+    },
+    enabled: enabled && projectId !== null,
+    staleTime: 5_000,
+  });
+}
+
+export function useApproveContext(projectId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const { data } = await client.post<Project>(`/projects/${projectId}/approve-context`);
+      return data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
+    },
+  });
+}
+
+export function useRetryContextComponent(projectId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (component: 'speaker_aggregation' | 'character_mapping' | 'style_bible') => {
+      const { data } = await client.post(`/projects/${projectId}/context/retry`, { component });
+      return data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'context'] });
+    },
+  });
+}
+
+export function useTranslateFile(projectId: number) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (fileId: number) => {
+      const { data } = await client.post<VideoFile>(`/projects/${projectId}/files/${fileId}/translate`);
+      return data;
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData<VideoFile[]>(
+        ['projects', projectId, 'files'],
+        (files) => files?.map((file) => (file.id === data.id ? { ...file, ...data } : file)),
+      );
+      queryClient.invalidateQueries({ queryKey: ['projects'] });
     },
   });
 }

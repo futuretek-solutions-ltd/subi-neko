@@ -13,6 +13,7 @@ from app.metadata.base import (
     Character,
     CharacterGender,
     CharacterRole,
+    Episode,
     MediaType,
     MetadataProvider,
     SearchResult,
@@ -69,6 +70,7 @@ def _strip_anidb_markup(text: str) -> str:
 class AniDBProvider(MetadataProvider):
     supports_search = True
     supports_characters = True
+    supports_episodes = True
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
@@ -251,6 +253,12 @@ class AniDBProvider(MetadataProvider):
                 if char_desc_el is not None and char_desc_el.text:
                     char_desc = _strip_anidb_markup(char_desc_el.text)
 
+                char_type_el = char_el.find("charactertype")
+                character_type = (char_type_el.text or "").strip() or None if char_type_el is not None else None
+
+                seiyuu_el = char_el.find("seiyuu")
+                voice_actor = (seiyuu_el.text or "").strip() or None if seiyuu_el is not None else None
+
                 char_id = char_el.get("id")
 
                 characters.append({
@@ -260,7 +268,46 @@ class AniDBProvider(MetadataProvider):
                     "role": role,
                     "gender": gender,
                     "description": char_desc,
+                    "voice_actor": voice_actor,
+                    "character_type": character_type,
                 })
+
+        # Episodes — the same cached XML carries per-episode titles/airdates.
+        # Only regular episodes (epno type="1") have an integer number.
+        episodes: list[dict] = []
+        eps_el = root.find("episodes")
+        if eps_el is not None:
+            for ep_el in eps_el.findall("episode"):
+                epno_el = ep_el.find("epno")
+                if epno_el is None or (epno_el.get("type") or "1") != "1":
+                    continue
+                try:
+                    number = int((epno_el.text or "").strip())
+                except ValueError:
+                    continue
+
+                ep_title = None
+                ep_title_native = None
+                for t in ep_el.findall("title"):
+                    lang = t.get(_XML_LANG, "")
+                    text = (t.text or "").strip()
+                    if not text:
+                        continue
+                    if lang == "en" and ep_title is None:
+                        ep_title = text
+                    elif lang == "ja" and ep_title_native is None:
+                        ep_title_native = text
+
+                airdate_el = ep_el.find("airdate")
+                air_date = (airdate_el.text or "").strip() or None if airdate_el is not None else None
+
+                episodes.append({
+                    "number": number,
+                    "title": ep_title,
+                    "title_native": ep_title_native,
+                    "air_date": air_date,
+                })
+        episodes.sort(key=lambda e: e["number"])
 
         details = {
             "provider_id": root.get("id", ""),
@@ -273,7 +320,7 @@ class AniDBProvider(MetadataProvider):
             "episode_count": episode_count,
         }
 
-        return {"details": details, "characters": characters}
+        return {"details": details, "characters": characters, "episodes": episodes}
 
     # ------------------------------------------------------------------
     # Public API
@@ -328,6 +375,21 @@ class AniDBProvider(MetadataProvider):
                 role=CharacterRole(c["role"]) if c["role"] else None,
                 gender=CharacterGender(c["gender"]) if c["gender"] else None,
                 description=c["description"],
+                voice_actor=c.get("voice_actor"),
+                character_type=c.get("character_type"),
             )
             for c in data["characters"]
+        ]
+
+    async def get_episodes(self, provider_id: str) -> list[Episode]:
+        data = await self._fetch_anime(provider_id)
+        # Entries cached before episode support lack the key — tolerate them.
+        return [
+            Episode(
+                number=e["number"],
+                title=e.get("title"),
+                title_native=e.get("title_native"),
+                air_date=e.get("air_date"),
+            )
+            for e in data.get("episodes", [])
         ]

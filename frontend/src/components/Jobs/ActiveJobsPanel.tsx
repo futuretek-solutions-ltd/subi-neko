@@ -17,10 +17,8 @@ const JOB_LABELS: Record<string, string> = {
   translate_chunk: 'Translate',
   validate_chunk: 'Validate',
   repair_chunk: 'Repair',
-  review_chunk_rules: 'Review (rules)',
-  review_chunk_grammar: 'Review (grammar)',
-  review_chunk_languagetool: 'Review (grammar)',
-  review_chunk_llm: 'Review (LLM)',
+  polish_chunk: 'Polish',
+  review_chunk_final: 'Final review',
   resolve_style_fonts: 'Resolve fonts',
   render_output_ass: 'Render ASS',
   mux_output_mkv: 'Mux MKV',
@@ -28,7 +26,7 @@ const JOB_LABELS: Record<string, string> = {
 
 const CHUNK_JOB_TYPES = new Set([
   'translate_chunk', 'validate_chunk', 'repair_chunk',
-  'review_chunk_rules', 'review_chunk_grammar', 'review_chunk_languagetool', 'review_chunk_llm',
+  'polish_chunk', 'review_chunk_final',
 ]);
 
 function jobLabel(job: Job): string {

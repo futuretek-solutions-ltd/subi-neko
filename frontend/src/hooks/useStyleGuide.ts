@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import client from '../api/client';
 
 export interface GlossaryTerm {
@@ -153,15 +153,33 @@ export interface TmEntry {
   updated_at: string;
 }
 
+export interface TmListPage {
+  total: number;
+  items: TmEntry[];
+}
+
+const TM_PAGE_SIZE = 200;
+
 export function useTranslationMemory(projectId: number, enabled: boolean, query: string) {
-  return useQuery<TmEntry[]>({
+  return useInfiniteQuery<TmListPage>({
     queryKey: ['projects', projectId, 'translation-memory', query],
-    queryFn: async () => {
-      const { data } = await client.get<TmEntry[]>(
+    queryFn: async ({ pageParam }) => {
+      const { data } = await client.get<TmListPage>(
         `/projects/${projectId}/translation-memory`,
-        { params: query ? { q: query } : {} },
+        {
+          params: {
+            ...(query ? { q: query } : {}),
+            offset: pageParam as number,
+            limit: TM_PAGE_SIZE,
+          },
+        },
       );
       return data;
+    },
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, allPages) => {
+      const fetched = allPages.reduce((n, p) => n + p.items.length, 0);
+      return fetched < lastPage.total ? fetched : undefined;
     },
     enabled,
     staleTime: 10_000,

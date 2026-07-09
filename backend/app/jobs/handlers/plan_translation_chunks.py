@@ -8,11 +8,70 @@ from typing import Any
 from sqlalchemy import delete, select
 
 from app.core.database import SyncSessionLocal
-from app.db.models import File, SubtitleChunk, SubtitleEvent
+from app.db.models import File, ProjectSpeaker, SubtitleChunk, SubtitleEvent
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.registry import register_job_handler
+from app.subs.content_classification import classify_content_type
 
 logger = logging.getLogger(__name__)
+
+SPEAKER_TAG_REASON = "speaker_tag"
+
+
+def _reset_machine_translation(event: SubtitleEvent) -> None:
+    """A content-type change invalidates a machine translation (wrong prompt
+    path, possibly wrong register). User edits are never touched."""
+    if event.translated_text is not None and not event.is_user_edited:
+        event.translated_text = None
+        event.original_ai_translated_text = None
+        event.translation_confidence = None
+        event.translation_status = "pending"
+
+
+def _apply_speaker_content_tags(session, file: File, now: str) -> int:
+    """Re-type events according to speaker content tags (and revert events
+    whose speaker tag was removed). Runs before partitioning so tagged
+    speakers' lines land in the matching content-type chunks. Idempotent."""
+    tag_by_name: dict[str, str] = {
+        name: tag
+        for name, tag in session.execute(
+            select(ProjectSpeaker.name, ProjectSpeaker.content_tag)
+            .where(ProjectSpeaker.project_id == file.project_id)
+            .where(ProjectSpeaker.content_tag.is_not(None))
+        ).all()
+    }
+
+    events = session.scalars(
+        select(SubtitleEvent)
+        .where(SubtitleEvent.file_id == file.id)
+        .where(SubtitleEvent.event_type == "dialogue")
+    ).all()
+
+    changed = 0
+    for event in events:
+        tag = tag_by_name.get(event.name) if event.name else None
+        if tag is not None:
+            if event.content_type != tag or event.content_type_reason != SPEAKER_TAG_REASON:
+                if event.content_type != tag:
+                    _reset_machine_translation(event)
+                event.content_type = tag
+                event.content_type_reason = SPEAKER_TAG_REASON
+                event.updated_at = now
+                changed += 1
+        elif event.content_type_reason == SPEAKER_TAG_REASON:
+            # Tag removed — restore the heuristic classification.
+            content_type, reason = classify_content_type(
+                event.event_type, event.style or "", event.source_text or "")
+            if event.content_type != content_type:
+                _reset_machine_translation(event)
+            event.content_type = content_type
+            event.content_type_reason = reason
+            event.updated_at = now
+            changed += 1
+
+    if changed:
+        session.commit()
+    return changed
 
 
 def _effective_chunk_size(total_lines: int, configured_chunk_size: int) -> int:
@@ -92,6 +151,10 @@ def plan_translation_chunks(
             return JobResult(status="failed", result=None,
                              error_code="FILE_NOT_FOUND",
                              error_message=f"File id={file_id} not found")
+
+        retagged = _apply_speaker_content_tags(session, file, now)
+        if retagged:
+            progress(0.15, f"Re-typed {retagged} events from speaker content tags")
 
         # All Dialogue-type events in line order, with their content_type classification
         rows = session.execute(

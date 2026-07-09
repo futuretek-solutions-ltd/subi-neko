@@ -9,7 +9,7 @@ For each FAILED line you are given:
 Formatting markers
 The text may contain placeholder markers standing for subtitle formatting. Treat them as opaque symbols:
   ⟦1⟧, ⟦2⟧, …  — inline formatting markers. The repaired translation must contain every marker present in the source exactly once, positioned around the same word or phrase. Never invent new markers or drop existing ones.
-  ⏎ — line break. ␤ — soft line break. ␣ — hard space. Keep the same count of each as in the source.
+  ⏎ — line break. ␤ — soft line break. Keep the same count of each as in the source. ␣ — hard space: keep them where they separate words, but you may adjust how many appear in an alignment run to fit the repaired text.
 
 Repair rules
 - Repair ONLY the requested FAILED lines; include exactly one repair entry per FAILED line.
@@ -18,7 +18,7 @@ Repair rules
 
 How to target each error type
 - formatting_tag_mismatch / marker errors: place every ⟦n⟧ marker from the source exactly once in the repaired line.
-- escape_mismatch: match the source counts of ⏎, ␤ and ␣ exactly.
+- escape_mismatch: match the source counts of ⏎ and ␤ exactly.
 - missing_translation: discard the faulty attempt and produce a fresh {TARGET_LANG_NAME} translation from the source text.
 - locked_line_modified: reproduce the source text verbatim.
 - text_corruption: strip assistant-generated artifacts and produce clean, minimal subtitle text.

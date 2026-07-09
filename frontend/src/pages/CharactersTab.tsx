@@ -16,7 +16,7 @@ import {
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import { ArrowsClockwise, CaretDown, CaretRight, Plus } from '@phosphor-icons/react';
-import type { ProjectCharacterWithSpeakers, ProjectSpeaker } from '../types';
+import type { ProjectCharacterWithSpeakers, ProjectSpeaker, SpeakerContentTag } from '../types';
 import {
   useCreateCharacter,
   useProjectCharacters,
@@ -37,6 +37,20 @@ const GENDER_OPTIONS = [
 
 const EXTRA_VALUE = '__extra__';
 const NONE_VALUE = '__none__';
+
+// Content-tag select values: speakers whose "lines" are actually on-screen
+// text / lyrics rather than a character's dialogue.
+const TAG_VALUE_PREFIX = '__tag_';
+const CONTENT_TAG_OPTIONS: { value: string; tag: SpeakerContentTag; label: string }[] = [
+  { value: '__tag_sign__', tag: 'sign', label: 'Sign / typesetting' },
+  { value: '__tag_karaoke__', tag: 'karaoke', label: 'Karaoke' },
+  { value: '__tag_song__', tag: 'song', label: 'Song / lyrics' },
+];
+const CONTENT_TAG_COLORS: Record<SpeakerContentTag, string> = {
+  sign: 'grape',
+  song: 'cyan',
+  karaoke: 'teal',
+};
 
 function ConfidenceBadge({ speaker }: { speaker: ProjectSpeaker }) {
   if (speaker.match_origin === 'manual') {
@@ -84,22 +98,35 @@ function SpeakerRow({
   const updateSpeaker = useUpdateSpeaker();
   const retranslate = useRetranslateAffected();
 
-  const selectValue = speaker.is_extra
-    ? EXTRA_VALUE
-    : speaker.character_id !== null
-      ? String(speaker.character_id)
-      : NONE_VALUE;
+  const selectValue = speaker.content_tag !== null
+    ? `${TAG_VALUE_PREFIX}${speaker.content_tag}__`
+    : speaker.is_extra
+      ? EXTRA_VALUE
+      : speaker.character_id !== null
+        ? String(speaker.character_id)
+        : NONE_VALUE;
 
   async function handleCharacterChange(value: string | null) {
     if (value === null || value === selectValue) return;
-    const payload = value === EXTRA_VALUE
-      ? { projectId, speakerId: speaker.id, is_extra: true }
-      : value === NONE_VALUE
-        ? { projectId, speakerId: speaker.id, character_id: null, is_extra: false }
-        : { projectId, speakerId: speaker.id, character_id: Number(value), is_extra: false };
+    const tagOption = CONTENT_TAG_OPTIONS.find((o) => o.value === value);
+    const payload = tagOption
+      ? { projectId, speakerId: speaker.id, content_tag: tagOption.tag }
+      : value === EXTRA_VALUE
+        ? { projectId, speakerId: speaker.id, is_extra: true }
+        : value === NONE_VALUE
+          ? { projectId, speakerId: speaker.id, character_id: null, is_extra: false, content_tag: null }
+          : { projectId, speakerId: speaker.id, character_id: Number(value), is_extra: false };
     try {
       const result = await updateSpeaker.mutateAsync(payload);
-      if (result.affected_chunk_count > 0) {
+      if (tagOption) {
+        notifications.show({
+          color: 'blue',
+          title: 'Speaker tagged',
+          message: `Lines of "${speaker.name}" will be treated as ${tagOption.tag} `
+            + 'when a file\'s chunks are next planned. Already-planned files keep their chunks.',
+        });
+      }
+      if (result.affected_chunk_count > 0 && !tagOption) {
         notifications.show({
           color: 'yellow',
           title: 'Mapping corrected',
@@ -135,7 +162,13 @@ function SpeakerRow({
         {speaker.line_count}
       </Text>
       <div style={{ width: 110, flexShrink: 0 }}>
-        <ConfidenceBadge speaker={speaker} />
+        {speaker.content_tag ? (
+          <Badge size="xs" variant="light" color={CONTENT_TAG_COLORS[speaker.content_tag]}>
+            {speaker.content_tag}
+          </Badge>
+        ) : (
+          <ConfidenceBadge speaker={speaker} />
+        )}
       </div>
       <Tooltip label="Overrides the character's gender in translation prompts" withArrow>
         <Select
@@ -159,7 +192,13 @@ function SpeakerRow({
         data={[
           { value: NONE_VALUE, label: '— unmapped —' },
           { value: EXTRA_VALUE, label: 'Extra / non-character' },
-          ...characterOptions,
+          {
+            group: 'Non-dialogue content',
+            items: CONTENT_TAG_OPTIONS.map(({ value, label }) => ({ value, label })),
+          },
+          ...(characterOptions.length
+            ? [{ group: 'Characters', items: characterOptions }]
+            : []),
         ]}
         value={selectValue}
         onChange={(v) => void handleCharacterChange(v)}

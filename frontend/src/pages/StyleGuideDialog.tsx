@@ -320,7 +320,12 @@ function TmRow({ entry, projectId }: { entry: TmEntry; projectId: number }) {
 
 function TranslationMemoryTab({ projectId }: { projectId: number }) {
   const [search, setSearch] = useState('');
-  const { data: entries, isLoading } = useTranslationMemory(projectId, true, search);
+  const {
+    data, isLoading, fetchNextPage, hasNextPage, isFetchingNextPage,
+  } = useTranslationMemory(projectId, true, search);
+
+  const entries = data?.pages.flatMap((p) => p.items) ?? [];
+  const total = data?.pages[0]?.total ?? 0;
 
   return (
     <Stack gap="sm" pt="sm">
@@ -335,31 +340,46 @@ function TranslationMemoryTab({ projectId }: { projectId: number }) {
         value={search}
         onChange={(e) => setSearch(e.currentTarget.value)}
       />
-      {isLoading || !entries ? (
+      {isLoading || !data ? (
         <Center h={160}><Loader size="sm" /></Center>
       ) : entries.length === 0 ? (
         <Text size="xs" c="dimmed">
           {search ? 'No matching entries.' : 'Empty — the memory fills as files are accepted.'}
         </Text>
       ) : (
-        <ScrollArea.Autosize mah={420}>
-          <Table verticalSpacing={4} withRowBorders={false}>
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th>Source</Table.Th>
-                <Table.Th>Translation</Table.Th>
-                <Table.Th style={{ width: 80 }}>Origin</Table.Th>
-                <Table.Th style={{ width: 60 }}>Uses</Table.Th>
-                <Table.Th style={{ width: 40 }} />
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {entries.map((entry) => (
-                <TmRow key={entry.id} entry={entry} projectId={projectId} />
-              ))}
-            </Table.Tbody>
-          </Table>
-        </ScrollArea.Autosize>
+        <>
+          <ScrollArea.Autosize mah={420}>
+            <Table verticalSpacing={4} withRowBorders={false}>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Source</Table.Th>
+                  <Table.Th>Translation</Table.Th>
+                  <Table.Th style={{ width: 80 }}>Origin</Table.Th>
+                  <Table.Th style={{ width: 60 }}>Uses</Table.Th>
+                  <Table.Th style={{ width: 40 }} />
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {entries.map((entry) => (
+                  <TmRow key={entry.id} entry={entry} projectId={projectId} />
+                ))}
+              </Table.Tbody>
+            </Table>
+          </ScrollArea.Autosize>
+          <Group justify="space-between">
+            <Text size="xs" c="dimmed">{entries.length} of {total} entries</Text>
+            {hasNextPage && (
+              <Button
+                size="compact-xs"
+                variant="light"
+                loading={isFetchingNextPage}
+                onClick={() => fetchNextPage()}
+              >
+                Load more
+              </Button>
+            )}
+          </Group>
+        </>
       )}
     </Stack>
   );

@@ -1,6 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import client from '../api/client';
-import type { ProjectCharacterWithSpeakers, ProjectSpeaker, SpeakerUpdateResult } from '../types';
+import type {
+  ProjectCharacterWithSpeakers,
+  ProjectSpeaker,
+  SpeakerContentTag,
+  SpeakerUpdateResult,
+} from '../types';
 
 interface CharacterUpdatePayload {
   projectId: number;
@@ -17,6 +22,7 @@ interface SpeakerUpdatePayload {
   gender?: string | null;
   character_id?: number | null;
   is_extra?: boolean;
+  content_tag?: SpeakerContentTag | null;
 }
 
 export function useProjectCharacters(projectId: number | null) {

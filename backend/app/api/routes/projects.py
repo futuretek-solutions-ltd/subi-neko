@@ -125,6 +125,7 @@ class SpeakerOut(BaseModel):
     line_count: int
     sample_lines: list[str]
     is_extra: bool
+    content_tag: Literal["sign", "karaoke", "song"] | None
     created_at: str
     updated_at: str
 
@@ -135,6 +136,7 @@ class SpeakerUpdateIn(BaseModel):
     gender: CharacterGender | None = None
     character_id: int | None = None
     is_extra: bool | None = None
+    content_tag: Literal["sign", "karaoke", "song"] | None = None
 
 
 class SpeakerUpdateOut(BaseModel):
@@ -1128,23 +1130,29 @@ async def list_file_chunks(project_id: int, file_id: int):
             .order_by(SubtitleChunk.chunk_index)
         )).all())
 
-        # Aggregate unresolved QA items by line_index and severity in one query
+        # Aggregate unresolved QA items by line_index, content_type and
+        # severity in one query
         qa_rows = (await session.execute(
             select(
                 SubtitleEvent.line_index,
+                SubtitleEvent.content_type,
                 QaItem.severity,
                 func.count().label("cnt"),
             )
             .join(QaItem, QaItem.subtitle_event_id == SubtitleEvent.id)
             .where(SubtitleEvent.file_id == file_id)
             .where(QaItem.is_resolved == 0)
-            .group_by(SubtitleEvent.line_index, QaItem.severity)
+            .group_by(SubtitleEvent.line_index, SubtitleEvent.content_type,
+                      QaItem.severity)
         )).all()
 
-        # Build line_index → {severity: count} map
-        qa_by_line: dict[int, dict[str, int]] = {}
+        # Build (line_index, content_type) → {severity: count} map. Chunk line
+        # ranges of different content types overlap (a sign chunk's from/to
+        # spans its sparse member lines), so counts must be matched per type.
+        qa_by_line: dict[tuple[int, str], dict[str, int]] = {}
         for row in qa_rows:
-            qa_by_line.setdefault(row.line_index, {})[row.severity] = int(row.cnt)
+            key = (row.line_index, row.content_type or "dialogue")
+            qa_by_line.setdefault(key, {})[row.severity] = int(row.cnt)
 
         job_rows = list((await session.scalars(
             select(JobRecord)
@@ -1174,8 +1182,11 @@ async def list_file_chunks(project_id: int, file_id: int):
 
         result = []
         for chunk in chunks:
+            chunk_content_type = chunk.content_type or "dialogue"
             errors = warnings = 0
-            for line_idx, sevs in qa_by_line.items():
+            for (line_idx, event_content_type), sevs in qa_by_line.items():
+                if event_content_type != chunk_content_type:
+                    continue
                 if chunk.translate_from_line <= line_idx <= chunk.translate_to_line:
                     errors += sevs.get("blocker", 0)
                     warnings += sevs.get("warning", 0) + sevs.get("info", 0)
@@ -1521,6 +1532,7 @@ def _speaker_out(speaker: ProjectSpeaker, character_name: str | None) -> Speaker
         line_count=speaker.line_count or 0,
         sample_lines=[s for s in samples if isinstance(s, str)],
         is_extra=bool(speaker.is_extra),
+        content_tag=speaker.content_tag,
         created_at=speaker.created_at,
         updated_at=speaker.updated_at,
     )
@@ -1618,6 +1630,8 @@ async def update_project_speaker(project_id: int, speaker_id: int, body: Speaker
             speaker.match_confidence = 1.0
             speaker.match_rationale = None
             speaker.is_extra = 0
+            if character_id is not None:
+                speaker.content_tag = None
         if "gender" in update_data:
             gender = update_data["gender"]
             speaker.gender = gender.value if isinstance(gender, CharacterGender) else gender
@@ -1627,6 +1641,19 @@ async def update_project_speaker(project_id: int, speaker_id: int, body: Speaker
                 speaker.character_id = None
                 speaker.match_origin = "manual"
                 speaker.match_confidence = 1.0
+                speaker.content_tag = None
+        if "content_tag" in update_data:
+            content_tag = update_data["content_tag"]
+            speaker.content_tag = content_tag
+            if content_tag is not None:
+                # Tagging as sign/karaoke/song is mutually exclusive with a
+                # character mapping or the extra flag; manual origin protects
+                # the row from the inference job.
+                speaker.character_id = None
+                speaker.is_extra = 0
+                speaker.match_origin = "manual"
+                speaker.match_confidence = 1.0
+                speaker.match_rationale = None
 
         speaker.updated_at = now
         await session.commit()
@@ -1884,27 +1911,41 @@ class TmEntryUpdateIn(BaseModel):
     target_text: str = Field(min_length=1)
 
 
-@router.get("/{project_id}/translation-memory", response_model=list[TmEntryOut])
-async def list_translation_memory(project_id: int, q: str | None = None, limit: int = 200):
+class TmListOut(BaseModel):
+    total: int
+    items: list[TmEntryOut]
+
+
+@router.get("/{project_id}/translation-memory", response_model=TmListOut)
+async def list_translation_memory(
+    project_id: int, q: str | None = None, limit: int = 200, offset: int = 0,
+):
     limit = max(1, min(limit, 500))
+    offset = max(0, offset)
     async with AsyncSessionLocal() as session:
         await _get_project_or_404(session, project_id)
-        query = (
-            select(TranslationMemoryEntry)
-            .where(TranslationMemoryEntry.project_id == project_id)
-        )
+        filters = [TranslationMemoryEntry.project_id == project_id]
         if q and q.strip():
             pattern = f"%{q.strip()}%"
-            query = query.where(
+            filters.append(
                 TranslationMemoryEntry.source_text.ilike(pattern)
                 | TranslationMemoryEntry.target_text.ilike(pattern)
             )
+        total = (await session.execute(
+            select(func.count()).select_from(TranslationMemoryEntry).where(*filters)
+        )).scalar_one()
         rows = await session.scalars(
-            query.order_by(TranslationMemoryEntry.use_count.desc(),
-                           TranslationMemoryEntry.updated_at.desc())
+            select(TranslationMemoryEntry)
+            .where(*filters)
+            .order_by(TranslationMemoryEntry.use_count.desc(),
+                      TranslationMemoryEntry.updated_at.desc())
+            .offset(offset)
             .limit(limit)
         )
-        return list(rows.all())
+        return TmListOut(
+            total=int(total),
+            items=[TmEntryOut.model_validate(r) for r in rows.all()],
+        )
 
 
 @router.put("/{project_id}/translation-memory/{entry_id}", response_model=TmEntryOut)

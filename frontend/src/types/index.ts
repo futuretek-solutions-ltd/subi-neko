@@ -228,6 +228,8 @@ export interface ProjectCharacterWithSpeakers extends ProjectCharacter {
 
 export type MatchOrigin = 'manual' | 'fuzzy' | 'llm';
 
+export type SpeakerContentTag = 'sign' | 'karaoke' | 'song';
+
 export interface ProjectSpeaker {
   id: number;
   project_id: number;
@@ -241,6 +243,7 @@ export interface ProjectSpeaker {
   line_count: number;
   sample_lines: string[];
   is_extra: boolean;
+  content_tag: SpeakerContentTag | null;
   created_at: string;
   updated_at: string;
 }

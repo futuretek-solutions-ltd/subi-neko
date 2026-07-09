@@ -111,6 +111,22 @@ def test_unmask_restores_escapes():
     assert result == r"Jedna\NDva\hTři"
 
 
+def test_unmask_allows_hard_space_count_change():
+    # \h is alignment padding — translations may legitimately use a
+    # different number of them (e.g. column-aligned signs).
+    masked = mask_line(r"Name\h\h\h\hdies.\NOther\h\h\h\h\h\hlives.")
+    result, errors = unmask_line("Jméno␣␣umírá.⏎Jiný␣␣␣přežívá.", masked)
+    assert errors == []
+    assert result == r"Jméno\h\humírá.\NJiný\h\h\hpřežívá."
+
+
+def test_unmask_still_rejects_line_break_count_change():
+    masked = mask_line(r"One\NTwo\h\hThree")
+    result, errors = unmask_line("Jedna Dva␣Tři", masked)
+    assert result is None
+    assert any(e.startswith("escape_count:\\N") for e in errors)
+
+
 def test_force_unmask_appends_missing_markers():
     source = r"A {\i1}b{\i0} c"
     masked = mask_line(source)

@@ -161,12 +161,16 @@ async def _create_chunk(
     failed_job_type: str | None = None,
     last_error_code: str | None = None,
     last_error_message: str | None = None,
+    content_type: str = "dialogue",
+    translate_from_line: int = 0,
+    translate_to_line: int = 10,
 ) -> SubtitleChunk:
     c = SubtitleChunk(
         file_id=file_id,
         chunk_index=chunk_index,
-        translate_from_line=0,
-        translate_to_line=10,
+        translate_from_line=translate_from_line,
+        translate_to_line=translate_to_line,
+        content_type=content_type,
         status=status,
         llm_review_needed=1 if llm_review_needed else 0,
         repair_attempt_count=repair_attempt_count,
@@ -258,6 +262,7 @@ async def _create_qa_item(
     file_id: int,
     severity: str = "blocker",
     is_resolved: int = 0,
+    subtitle_event_id: int | None = None,
 ) -> QaItem:
     q = QaItem(
         file_id=file_id,
@@ -265,6 +270,7 @@ async def _create_qa_item(
         qa_type="test_issue",
         message="Test QA issue",
         is_resolved=is_resolved,
+        subtitle_event_id=subtitle_event_id,
         created_at=datetime.utcnow().isoformat(),
     )
     session.add(q)
@@ -280,11 +286,13 @@ async def _create_event(
     translated_text: str | None = "Ahoj",
     original_ai_translated_text: str | None = "Ahoj",
     is_user_edited: int = 0,
+    content_type: str = "dialogue",
 ) -> SubtitleEvent:
     e = SubtitleEvent(
         file_id=file_id,
         line_index=line_index,
         event_type="dialogue",
+        content_type=content_type,
         layer=0,
         start_ms=0,
         end_ms=1000,
@@ -2057,3 +2065,48 @@ class TestContextGateEndpoints:
             await retry_context_component(
                 project.id, ContextRetryIn(component="character_mapping"))
         assert exc_info.value.status_code == 409
+
+
+# ===========================================================================
+# Chunk list QA attribution tests
+# ===========================================================================
+
+class TestListFileChunksQaAttribution:
+    """QA counts must be attributed per content type — a sign chunk's
+    from/to range spans its sparse member lines and overlaps dialogue
+    lines, but must not absorb their QA items."""
+
+    @pytest.mark.asyncio
+    async def test_sign_chunk_does_not_absorb_dialogue_issues(self, db_session):
+        from app.api.routes.projects import list_file_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+
+        # Dialogue chunk covers lines 0-10; sign chunk's sparse members are
+        # lines 2 and 8, so its range [2, 8] overlaps the dialogue lines.
+        await _create_chunk(db_session, file.id, 0, status="complete",
+                            content_type="dialogue",
+                            translate_from_line=0, translate_to_line=10)
+        await _create_chunk(db_session, file.id, 1, status="complete",
+                            content_type="sign",
+                            translate_from_line=2, translate_to_line=8)
+
+        dialogue_event = await _create_event(db_session, file.id, line_index=5)
+        sign_event = await _create_event(db_session, file.id, line_index=8,
+                                         content_type="sign")
+
+        await _create_qa_item(db_session, file.id, severity="blocker",
+                              subtitle_event_id=dialogue_event.id)
+        await _create_qa_item(db_session, file.id, severity="warning",
+                              subtitle_event_id=sign_event.id)
+
+        result = await list_file_chunks(project.id, file.id)
+
+        dialogue_chunk = next(c for c in result if c.content_type == "dialogue")
+        sign_chunk = next(c for c in result if c.content_type == "sign")
+
+        assert dialogue_chunk.qa_errors == 1
+        assert dialogue_chunk.qa_warnings == 0
+        assert sign_chunk.qa_errors == 0
+        assert sign_chunk.qa_warnings == 1

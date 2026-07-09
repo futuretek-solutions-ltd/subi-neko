@@ -70,6 +70,11 @@ def _detect_sign_fragments(tgt_snapshot: list[dict]) -> tuple[set[int], dict[str
         if len(events) < 2:
             continue
         texts = [plain_text(e["source_text"]).strip() for e in events]
+        # Identical texts are layered copies of one word (blur/outline/fill
+        # layers), not a mid-word split — safe to translate; the identical-
+        # sign grouping propagates one translation to every layer.
+        if len(set(texts)) == 1:
+            continue
         # A lowercase-initial continuation marks a mid-word split — a
         # standalone sign starts its own word.
         if not any(t[0].islower() for t in texts[1:]):

@@ -408,6 +408,25 @@ function FileChunksPanel({ projectId, fileId }: { projectId: number; fileId: num
   if (isLoading) return <Center py="xs"><Loader size="xs" /></Center>;
   if (!chunks?.length) return <Text size="xs" c="dimmed" py="xs">No chunks yet.</Text>;
 
+  // "sign 2" instead of a wall of identical "sign" badges: per-type ordinal,
+  // shown only when a content type has more than one chunk.
+  const typeTotals = new Map<string, number>();
+  for (const c of chunks as SubtitleChunk[]) {
+    typeTotals.set(c.content_type, (typeTotals.get(c.content_type) ?? 0) + 1);
+  }
+  const typeSeen = new Map<string, number>();
+  const badgeLabels = new Map<number, string>();
+  for (const c of chunks as SubtitleChunk[]) {
+    const ordinal = (typeSeen.get(c.content_type) ?? 0) + 1;
+    typeSeen.set(c.content_type, ordinal);
+    badgeLabels.set(
+      c.id,
+      (typeTotals.get(c.content_type) ?? 0) > 1
+        ? `${c.content_type} ${ordinal}`
+        : c.content_type,
+    );
+  }
+
   return (
     <ScrollArea type="auto" offsetScrollbars>
       <Table fz="xs" withColumnBorders={false} style={{ minWidth: 1105, tableLayout: 'fixed' }}>
@@ -440,7 +459,7 @@ function FileChunksPanel({ projectId, fileId }: { projectId: number; fileId: num
                   color={CONTENT_TYPE_COLORS[c.content_type] ?? 'gray'}
                   title={`Lines ${c.translate_from_line}–${c.translate_to_line}`}
                 >
-                  {c.content_type}
+                  {badgeLabels.get(c.id) ?? c.content_type}
                 </Badge>
               )}
             </Table.Td>

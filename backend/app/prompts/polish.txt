@@ -9,7 +9,7 @@ Some lines carry an extra "fix:" note naming a specific problem found by automat
 
 Formatting markers
   ⟦1⟧, ⟦2⟧, …  — inline formatting markers; keep every marker exactly once, around the same word or phrase.
-  ⏎ — line break. ␤ — soft line break. ␣ — hard space. Keep the same count of each; you may move them to better break points.
+  ⏎ — line break. ␤ — soft line break. Keep the same count of each; you may move them to better break points. ␣ — hard space: keep them where they separate words, but you may adjust how many appear in an alignment run to fit the edited text.
 
 Editing checklist — fix every occurrence of:
 1. Calques: word-for-word structures carried over from English that no native speaker would write.

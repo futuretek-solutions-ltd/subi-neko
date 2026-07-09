@@ -167,6 +167,7 @@ class ProjectSpeaker(Base):
     line_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     sample_lines_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_extra: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")  # "Boy A", "Crowd", "TV"…
+    content_tag: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # sign|karaoke|song
     created_at: Mapped[datetime] = mapped_column(Text, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(Text, nullable=False, server_default=func.now(), onupdate=func.now())
 

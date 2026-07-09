@@ -97,6 +97,11 @@ def unmask_line(llm_text: str, masked: MaskedLine) -> tuple[str | None, list[str
         errors.append("stray_marker_char")
 
     for char, expected in masked.escape_counts.items():
+        # ␣ (\h) is presentation padding — its count legitimately changes
+        # with translated word widths (e.g. column alignment), so it is not
+        # verified. ⏎/␤ (line breaks) must be preserved exactly.
+        if char == "␣":
+            continue
         actual = llm_text.count(char)
         if actual != expected:
             escape = _CHAR_TO_ESCAPE[char]

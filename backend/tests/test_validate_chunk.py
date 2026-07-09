@@ -62,6 +62,32 @@ def test_escape_mismatch_accepts_preserved_ass_newline():
     assert issues == []
 
 
+def test_escape_mismatch_allows_hard_space_count_change():
+    # \h runs are alignment padding whose width legitimately changes with
+    # the translated words — count differences must not fail validation.
+    issues = _check_escape_mismatch(
+        EventProxy(
+            translated_text=r"Yurine\h\h\h\hZemře na dropkick.\N\h\h\hostatní",
+            source_text=r"Yurine\h\h\h\h\h\h\hDies by dropkick.\N\h\h\h\h\hothers",
+        )  # type: ignore[arg-type]
+    )
+
+    assert issues == []
+
+
+def test_escape_mismatch_still_rejects_dropped_newline():
+    issues = _check_escape_mismatch(
+        EventProxy(
+            translated_text=r"Jedna Dva",
+            source_text=r"One\NTwo",
+        )  # type: ignore[arg-type]
+    )
+
+    assert issues
+    assert issues[0][0] == "escape_mismatch"
+    assert r"\N" in issues[0][2]
+
+
 def test_text_corruption_allows_bracketed_ass_screen_text_after_tags():
     issues = _check_text_corruption(
         EventProxy(

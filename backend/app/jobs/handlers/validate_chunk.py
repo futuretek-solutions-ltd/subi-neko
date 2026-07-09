@@ -149,7 +149,9 @@ def _check_formatting_tag_mismatch_relaxed(event: SubtitleEvent) -> list[tuple[s
     return []
 
 
-_ASS_ESCAPES = [r"\N", r"\n", r"\h"]
+# \h is deliberately absent: hard spaces are presentation padding whose
+# count legitimately changes with translated word widths (column alignment).
+_ASS_ESCAPES = [r"\N", r"\n"]
 
 
 def _check_escape_mismatch(event: SubtitleEvent) -> list[tuple[str, str, dict]]:

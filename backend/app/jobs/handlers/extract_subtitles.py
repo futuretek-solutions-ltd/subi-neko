@@ -17,6 +17,7 @@ from app.core.database import SyncSessionLocal
 from app.db.models import File, Subtitle, SubtitleEvent, SubtitleStyle
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.registry import register_job_handler
+from app.subs.content_classification import classify_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -25,49 +26,6 @@ _KNOWN_SCRIPT_INFO_KEYS = {
     "ScaledBorderAndShadow", "LayoutResX", "LayoutResY",
     "YCbCr Matrix", "Kerning",
 }
-
-# --- Content-type classification -------------------------------------------
-# Tag-based signals are checked before style-name signals because many
-# fansub scripts leave styles unnamed/generic ("Default") or reuse one style
-# for both dialogue and signs — tag presence is unambiguous ASS semantics,
-# style naming is not. Classification never excludes a line from
-# translation; it only changes which prompt/validation path is used.
-
-_KARAOKE_TAG_RE = re.compile(r"\\k[fo]?\d", re.IGNORECASE)
-_POSITIONING_TAG_RE = re.compile(r"\\(?:pos|move|org|clip|iclip|t\()", re.IGNORECASE)
-# Word-boundary search: real releases compose lyric style names ("Romaji
-# Main", "ED Eng Main", "Copy of ED Romanji Secondary"). A bare "English"
-# style is deliberately NOT matched — some releases use it for dialogue.
-_SONG_STYLE_RE = re.compile(
-    r"\b(op|ed|oped|song|insert|kara|karaoke|romaji|romanji|lyrics?)\d*\b",
-    re.IGNORECASE,
-)
-_SIGN_STYLE_RE = re.compile(r"sign|title|caption|note|typeset|credit|logo", re.IGNORECASE)
-_TAG_BLOCK_RE = re.compile(r"\{[^}]*\}")
-
-
-def _classify_content_type(event_type: str, style: str, text: str) -> tuple[str, str | None]:
-    if event_type == "comment":
-        return "other", "ass_comment"
-
-    if _KARAOKE_TAG_RE.search(text):
-        return "karaoke", "k_tag"
-
-    if _POSITIONING_TAG_RE.search(text):
-        return "sign", "positioning_tag"
-
-    if style and _SONG_STYLE_RE.search(style):
-        return "song", "style_name"
-
-    if style and _SIGN_STYLE_RE.search(style):
-        return "sign", "style_name"
-
-    tag_chars = sum(len(m) for m in _TAG_BLOCK_RE.findall(text))
-    if len(text) > 0 and (tag_chars / len(text)) > 0.3:
-        return "sign", "tag_density"
-
-    return "dialogue", None
-
 
 def _color_to_str(c) -> str | None:
     if c is None:
@@ -224,7 +182,7 @@ def extract_subtitles(
     for idx, event in enumerate(subs):
         event_type = event.type.lower()
         style = event.style or ""
-        content_type, content_type_reason = _classify_content_type(event_type, style, event.text)
+        content_type, content_type_reason = classify_content_type(event_type, style, event.text)
         event_rows.append(dict(
             file_id=file_id,
             line_index=idx,

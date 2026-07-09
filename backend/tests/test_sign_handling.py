@@ -67,6 +67,32 @@ def test_lone_sign_not_fragment():
     assert lines == set()
 
 
+def test_identical_layered_copies_not_fragments():
+    # Three layered copies of one lowercase word (blur/outline/fill layers
+    # positioned via \move) are duplicated copies, not a mid-word split —
+    # they must stay translatable.
+    events = [
+        _sign(1, 10, "{\\b1\\fs40\\move(760,170,439,218)}life", 1000, 2000),
+        _sign(2, 11, "{\\b1\\fs40\\blur4\\move(760,170,439,218)}life", 1000, 2000),
+        _sign(3, 12, "{\\b1\\fs40\\bord0\\move(760,170,439,218)}life", 1000, 2000),
+    ]
+    lines, anchors = _detect_sign_fragments(events)
+    assert lines == set()
+    assert anchors == {}
+
+
+def test_mixed_duplicate_and_continuation_still_fragments():
+    # A genuine split ("For" + "bidden") is still detected even when one
+    # fragment text repeats.
+    events = [
+        _sign(1, 10, "{\\pos(1,1)}For", 1000, 2000),
+        _sign(2, 11, "{\\pos(2,2)}bidden", 1000, 2000),
+        _sign(3, 12, "{\\pos(3,3)}bidden", 1000, 2000),
+    ]
+    lines, anchors = _detect_sign_fragments(events)
+    assert lines == {10, 11, 12}
+
+
 # --- polish char budget ------------------------------------------------------
 
 def test_char_budget_normal_dialogue():

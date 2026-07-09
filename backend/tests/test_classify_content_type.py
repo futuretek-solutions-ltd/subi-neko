@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.jobs.handlers.extract_subtitles import _classify_content_type
+from app.subs.content_classification import classify_content_type as _classify_content_type
 
 
 def test_comment_event_type_is_other():

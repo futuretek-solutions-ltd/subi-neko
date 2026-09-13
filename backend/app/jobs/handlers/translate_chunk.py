@@ -19,12 +19,16 @@ from app.jobs.handlers.prompt_context import (
     build_glossary_block,
     build_scene_block,
     build_speaker_identity_map,
+    build_lookahead_lines,
     build_style_block,
     build_tricky_notes_block,
     build_unmapped_speaker_block,
+    char_budget,
     load_analysis_context,
     load_episode_context,
+    load_following_context_events,
     load_glossary_terms,
+    load_preceding_context_events,
     load_prompt_characters,
     load_style_context,
     load_unmapped_gendered_speakers,
@@ -113,12 +117,29 @@ def _build_context_lines(
     return lines
 
 
+def _tm_hint(match: tm.TmMatch) -> str:
+    """One [TM] hint line.
+
+    An approximate match is labelled as such and shown WITH its own source
+    text: at the 92 % fuzzy cutoff the differing few percent can be the part
+    that carries the meaning, so the model has to be able to see what it is
+    being offered and how it differs — an unlabelled hint reads like an
+    established translation and invites a verbatim copy.
+    """
+    target = plain_text(match.target_text)
+    if match.score >= 100.0:
+        return f'  [TM] this line previously translated as: "{target}"'
+    return (f'  [TM ~{match.score:.0f}% match] the similar line '
+            f'"{plain_text(match.tm_source_text)}" was translated as "{target}"')
+
+
 def _build_target_lines(
     target_events: list[dict],
     masked: dict[int, MaskedLine],
     identities: dict[str, tuple[str | None, str | None]],
     with_identity: bool,
     tm_suggestions: dict[int, tm.TmMatch] | None = None,
+    budgets: dict[int, int] | None = None,
 ) -> list[str]:
     lines = []
     for e in target_events:
@@ -126,10 +147,13 @@ def _build_target_lines(
         if with_identity:
             identity = identities.get(e["name"] or "", (e["name"], None))
             suffix = _identity_suffix(identity)
-        lines.append(f"[TARGET] {e['line_index']}{suffix}: {masked[e['line_index']].text}")
+        budget = (budgets or {}).get(e["line_index"])
+        budget_part = f" | max {budget} chars" if budget is not None else ""
+        lines.append(
+            f"[TARGET] {e['line_index']}{suffix}{budget_part}: {masked[e['line_index']].text}")
         suggestion = (tm_suggestions or {}).get(e["line_index"])
         if suggestion is not None:
-            lines.append(f'  [TM] this line previously translated as: "{plain_text(suggestion.target_text)}"')
+            lines.append(_tm_hint(suggestion))
     return lines
 
 
@@ -192,22 +216,24 @@ def translate_chunk(
             .order_by(SubtitleEvent.line_index)
         ).all())
 
-        # Chronological context: the last N dialogue-type events of ANY
-        # content type preceding the target range, with their translations
-        # when already available (chunks run sequentially, so earlier chunks
-        # are normally translated by the time this one starts).
-        context_size = max(0, ctx.options.prepend_context_size)
-        context_events_rows: list[SubtitleEvent] = []
-        if context_size > 0:
-            context_events_rows = list(session.scalars(
-                select(SubtitleEvent)
-                .where(SubtitleEvent.file_id == file_id)
-                .where(SubtitleEvent.event_type == "dialogue")
-                .where(SubtitleEvent.line_index < translate_from)
-                .order_by(SubtitleEvent.line_index.desc())
-                .limit(context_size)
-            ).all())
-            context_events_rows.reverse()
+        # Chronological context: the preceding events of this chunk's own
+        # partition, with their translations when already available. For
+        # dialogue the gate guarantees they are polished, so the window
+        # carries the wording that actually ships.
+        context_events_rows = load_preceding_context_events(
+            session, file_id, content_type,
+            before_line=translate_from,
+            limit=max(0, ctx.options.prepend_context_size),
+        )
+
+        # Source-only lookahead: the lines after this chunk are still
+        # untranslated (the dialogue chain runs strictly forward), but their
+        # English is enough to stop the chunk's tail being translated blind.
+        lookahead_lines = build_lookahead_lines(load_following_context_events(
+            session, file_id, content_type,
+            after_line=translate_to,
+            limit=ctx.options.lookahead_context_size,
+        ))
 
         char_snapshot = list(characters)
         speaker_snapshot = list(unmapped_speakers)
@@ -302,7 +328,7 @@ def translate_chunk(
             ]
 
     progress(0.2, f"Building prompt ({len(llm_targets)} target, {len(tm_applied)} from TM, "
-                  f"{len(ctx_snapshot)} context lines)")
+                  f"{len(ctx_snapshot)} context, {len(lookahead_lines)} lookahead lines)")
 
     if content_type == "sign":
         system_prompt = ctx.options.resolved_sign_translation_prompt().strip()
@@ -342,6 +368,19 @@ def translate_chunk(
                 llm_targets = [e for e in llm_targets if e["line_index"] not in member_set]
 
         with_identity = content_type == "dialogue"
+
+        # Reading-speed budget per line, so the first draft is already close
+        # to what fits on screen. Without it the cheap model overruns and the
+        # polish pass spends its one full-coverage edit on condensing instead
+        # of naturalness. Signs and lyrics are glanced at, not read at a
+        # sustained rate — no budget for them.
+        budgets: dict[int, int] = {}
+        if content_type == "dialogue":
+            for e in tgt_snapshot:
+                budget = char_budget(e["start_ms"], e["end_ms"], ctx.options.cps_limit)
+                if budget is not None:
+                    budgets[e["line_index"]] = budget
+
         dialogue_lines = _build_context_lines(ctx_snapshot, identities)
         # TM-applied lines appear as read-only context in their position so
         # the model keeps continuity with them.
@@ -363,8 +402,10 @@ def translate_chunk(
                 in_chunk_lines += _build_context_lines([applied_by_line[li]], identities)
             elif li in target_by_line_order:
                 in_chunk_lines += _build_target_lines(
-                    [target_by_line_order[li]], masked, identities, with_identity, tm_suggest)
+                    [target_by_line_order[li]], masked, identities, with_identity,
+                    tm_suggest, budgets)
         dialogue_lines += in_chunk_lines
+        dialogue_lines += lookahead_lines
         dialogue_block = "\n".join(dialogue_lines)
 
         user_parts = []
@@ -453,7 +494,8 @@ def translate_chunk(
         if retry_lines:
             progress(0.75, f"Corrective retry for {len(retry_lines)} line(s)")
             retry_targets = [target_by_line[li] for li in retry_lines]
-            retry_block = "\n".join(_build_target_lines(retry_targets, masked, identities, with_identity))
+            retry_block = "\n".join(_build_target_lines(
+                retry_targets, masked, identities, with_identity, None, budgets))
             retry_message = (
                 "The following lines from your previous batch were missing or had "
                 "corrupted formatting markers. Retranslate exactly these lines. "
@@ -581,6 +623,7 @@ def translate_chunk(
             "tm_applied_events": len(tm_applied),
             "tm_suggested_events": len(tm_suggest),
             "context_events": len(ctx_snapshot),
+            "lookahead_events": len(lookahead_lines),
             "marker_fallback_events": len(marker_failed),
             "sign_group_propagated": sum(len(m) for m in group_members.values()),
             "fragment_words": len(fragment_qa),

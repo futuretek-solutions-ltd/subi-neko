@@ -19,7 +19,6 @@ from typing import Any
 from sqlalchemy import func, select
 
 from app.core.database import SyncSessionLocal
-from app.db.default_prompts import DEFAULT_STYLE_BIBLE_PROMPT, DEFAULT_STYLE_BIBLE_UPDATE_PROMPT
 from app.db.models import (
     File,
     ProjectAddressPair,
@@ -45,11 +44,6 @@ from app.subs.tag_masking import plain_text
 logger = logging.getLogger(__name__)
 
 _SAMPLE_SIZE = 300
-
-
-def _resolve_prompt(prompt: str, ctx: JobContext) -> str:
-    lang = ctx.options.target_lang_name or "the target language"
-    return prompt.replace("{TARGET_LANG_NAME}", lang)
 
 
 def _sample_dialogue(session, file_id: int, with_translation: bool) -> list[str]:
@@ -135,7 +129,7 @@ def generate_style_bible(
 
     progress(0.25, f"Building style bible prompt ({len(sample_lines)} sample lines)")
 
-    system_prompt = _resolve_prompt(DEFAULT_STYLE_BIBLE_PROMPT, ctx).strip()
+    system_prompt = ctx.options.resolved_style_bible_prompt().strip()
     user_parts = []
     if char_block:
         user_parts.append(f"## Characters\n{char_block}")
@@ -245,7 +239,7 @@ def update_style_bible(
 
     progress(0.25, "Building update prompt")
 
-    system_prompt = _resolve_prompt(DEFAULT_STYLE_BIBLE_UPDATE_PROMPT, ctx).strip()
+    system_prompt = ctx.options.resolved_style_bible_update_prompt().strip()
 
     glossary_block = "\n".join(
         f"- {t.source_term} => {t.target_term} ({t.category})" for t in terms

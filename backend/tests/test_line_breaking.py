@@ -67,3 +67,59 @@ def test_needs_three_rows_returns_none():
 def test_empty_and_markup_only():
     assert rebalance_rows("", 42) is None
     assert rebalance_rows("{\\pos(1,2)}", 42) is None
+
+
+# ---------------------------------------------------------------------------
+# Break-point quality (cost function, not pure balance)
+# ---------------------------------------------------------------------------
+
+def _rows(text: str, width: int) -> list[str]:
+    fixed = rebalance_rows(text, width)
+    assert fixed is not None
+    return fixed.split("\\N")
+
+
+def test_prefers_clause_boundary_over_stranded_conjunction():
+    # Pure balance put "když" at the end of row 1 (diff 3 vs 7); the
+    # conjunction belongs with the clause it introduces.
+    text = "Od dneška musíš vstávat dřív, když máš ranní doplňkové hodiny, ne?"
+    row1, row2 = _rows(text, 42)
+    assert row1.endswith("dřív,")
+    assert row2.startswith("když")
+
+
+def test_preposition_stays_with_its_noun_phrase():
+    # Pure balance broke between "na" and "kuchyňském".
+    text = "Nechal jsem ten dopis ležet na kuchyňském stole vedle klíčů."
+    row1, row2 = _rows(text, 34)
+    assert not row1.endswith(" na")
+    assert row2.startswith("na ")
+
+
+def test_enclitic_never_opens_the_second_row():
+    # Balance alone ties here, and the tie used to go to the split that puts
+    # the reflexive "se" at the head of row 2. An enclitic leans on the word
+    # before it, so it has to stay on row 1.
+    text = "Naši nejlepší přátelé se rozhodli odejít domů."
+    row1, row2 = _rows(text, 26)
+    assert row1.endswith(" se")
+    assert row2.startswith("rozhodli")
+
+
+def test_balance_still_decides_when_no_boundary_is_special():
+    # No punctuation, no function words — the old balance rule stands.
+    fixed = rebalance_rows("aaaa bbbb cccc dddd eeee ffff gggg hhhh", 25)
+    assert fixed is not None
+    r1, r2 = fixed.split("\\N")
+    assert abs(len(r1) - len(r2)) <= 5
+
+
+def test_cost_function_never_breaks_row_length_limit():
+    text = "Musíš mi slíbit, že se nikdy nevrátíš do toho starého domu u řeky."
+    for width in range(20, 45):
+        fixed = rebalance_rows(text, width)
+        if fixed is None:
+            continue
+        rows = fixed.split("\\N")
+        assert all(len(r) <= width for r in rows), (width, rows)
+        assert " ".join(rows) == text

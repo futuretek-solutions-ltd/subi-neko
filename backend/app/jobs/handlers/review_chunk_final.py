@@ -19,17 +19,26 @@ from typing import Any
 from sqlalchemy import delete, select
 
 from app.core.database import SyncSessionLocal
-from app.db.models import File, ProjectAddressPair, QaItem, SubtitleChunk, SubtitleEvent
+from app.db.models import (
+    File,
+    ProjectAddressPair,
+    ProjectCharacter,
+    QaItem,
+    SubtitleChunk,
+    SubtitleEvent,
+)
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.handlers.prompt_context import build_speaker_identity_map, load_glossary_terms
 from app.jobs.registry import register_job_handler
 from app.subs.czech_checks import (
+    check_addressee_gender_agreement,
     check_gender_agreement,
     check_readability,
     check_tv_against_pairs,
     check_tv_mixed_in_line,
     check_untranslated_english,
     check_vocative,
+    infer_addressee,
 )
 from app.subs.line_breaking import rebalance_rows
 logger = logging.getLogger(__name__)
@@ -56,6 +65,28 @@ _STRONG_QA_TYPES = FINAL_REVIEW_QA_TYPES - {"low_confidence"}
 # One targeted polish re-pass: first review may send the chunk back, the
 # second review always lets it through.
 _MAX_POLISH_ATTEMPTS = 2
+
+
+def _modes_for(
+    speaker: str | None,
+    addressee: str | None,
+    pair_modes: dict[tuple[str, str], set[str]],
+    name_aliases: dict[str, set[str]],
+) -> set[str] | None:
+    """The stored T-V modes for this exact speaker→addressee pair.
+
+    Address pairs are keyed by the raw speaker labels the script uses, while
+    the inferred addressee is a glossary name as it appears in the
+    translation, so the two are matched through the name's aliases.
+    """
+    if not speaker or not addressee:
+        return None
+    aliases = name_aliases.get(addressee) or {addressee.casefold()}
+    speaker_key = speaker.casefold()
+    modes: set[str] = set()
+    for alias in aliases:
+        modes |= pair_modes.get((speaker_key, alias), set())
+    return modes or None
 
 
 @register_job_handler("review_chunk_final")
@@ -110,7 +141,16 @@ def review_chunk_final(
         # Address-pair modes per raw speaker name (for the uniform-mode T-V
         # check) and glossary vocative forms.
         speaker_modes: dict[str, set[str]] = {}
+        # (speaker, addressee) → modes, both casefolded. Lets a line whose
+        # addressee is named in the text be checked against the pair that
+        # actually applies, instead of only the uniform-mode fallback.
+        pair_modes: dict[tuple[str, str], set[str]] = {}
         vocatives: dict[str, str] = {}
+        # Surface form (casefolded) → canonical name, for addressee detection.
+        address_forms: dict[str, str] = {}
+        # Canonical name → every alias an address pair might use for them.
+        name_aliases: dict[str, set[str]] = {}
+        name_genders: dict[str, str] = {}
         # Established names/honorifics are preserved verbatim by design —
         # they must not count as untranslated-English evidence.
         english_exclude: set[str] = set()
@@ -120,9 +160,36 @@ def review_chunk_final(
                 .where(ProjectAddressPair.project_id == file.project_id)
             ).all():
                 speaker_modes.setdefault(pair.speaker_name, set()).add(pair.mode)
+                pair_modes.setdefault(
+                    (pair.speaker_name.casefold(), pair.addressee_name.casefold()),
+                    set(),
+                ).add(pair.mode)
+
+            character_genders = {
+                name.casefold(): gender
+                for name, gender in session.execute(
+                    select(ProjectCharacter.name, ProjectCharacter.gender)
+                    .where(ProjectCharacter.project_id == file.project_id)
+                ).all() if gender
+            }
+
             for term in load_glossary_terms(session, file.project_id):
                 if term.category == "name" and term.vocative:
                     vocatives[term.target_term] = term.vocative
+                if term.category == "name":
+                    canonical = term.target_term
+                    forms = {term.target_term, term.vocative, term.source_term}
+                    for form in forms:
+                        if form and form.strip():
+                            address_forms.setdefault(form.casefold(), canonical)
+                    name_aliases[canonical] = {
+                        f.casefold() for f in forms if f and f.strip()
+                    }
+                    gender = term.gender or character_genders.get(
+                        (term.source_term or "").casefold()
+                    ) or character_genders.get((term.target_term or "").casefold())
+                    if gender in ("male", "female"):
+                        name_genders[canonical] = gender
                 if term.category in ("name", "honorific"):
                     for value in (term.source_term, term.target_term):
                         english_exclude.update((value or "").replace("-", " ").split())
@@ -187,8 +254,24 @@ def review_chunk_final(
         findings = []
         findings += check_gender_agreement(translated, gender)
         findings += check_tv_mixed_in_line(translated)
-        if snap["name"] and snap["name"] in speaker_modes:
-            findings += check_tv_against_pairs(translated, speaker_modes[snap["name"]])
+
+        # Who the line is spoken to, when the line names them. Unlocks
+        # second-person agreement and the exact T-V pair for this line.
+        addressee = infer_addressee(translated, address_forms) if address_forms else None
+        if addressee is not None:
+            findings += check_addressee_gender_agreement(
+                translated, name_genders.get(addressee), addressee)
+
+        speaker = snap["name"]
+        modes = _modes_for(speaker, addressee, pair_modes, name_aliases)
+        paired_with = addressee if modes is not None else None
+        if modes is None and speaker and speaker in speaker_modes:
+            # No pair for this specific addressee — fall back to the
+            # speaker's uniform mode, which is all the old check had.
+            modes = speaker_modes[speaker]
+        if modes:
+            findings += check_tv_against_pairs(translated, modes, paired_with)
+
         if vocatives:
             findings += check_vocative(translated, vocatives)
         findings += check_readability(translated, snap["end_ms"] - snap["start_ms"],

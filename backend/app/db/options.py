@@ -30,8 +30,12 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core.database import AsyncSessionLocal, SyncSessionLocal
 from app.db.default_prompts import (
+    DEFAULT_ANALYZE_PROMPT,
+    DEFAULT_MAPPING_PROMPT,
     DEFAULT_POLISH_PROMPT,
     DEFAULT_REPAIR_PROMPT,
+    DEFAULT_STYLE_BIBLE_PROMPT,
+    DEFAULT_STYLE_BIBLE_UPDATE_PROMPT,
     DEFAULT_TRANSLATION_PROMPT,
     DEFAULT_SIGN_TRANSLATION_PROMPT,
     DEFAULT_SONG_TRANSLATION_PROMPT,
@@ -51,6 +55,9 @@ class AppOptions:
     target_lang_code: str | None = None
     chunk_size: int = 100
     prepend_context_size: int = 10
+    # Source-only lines shown after a chunk's targets, so the tail of every
+    # chunk isn't translated blind to what follows. 0 disables.
+    lookahead_context_size: int = 5
     openai_api_base: str = "https://api.openai.com/v1"
     openai_api_key: str | None = None
     openai_model_cheap: str = "gpt-5.4-mini"
@@ -75,6 +82,10 @@ class AppOptions:
     polish_prompt: str = DEFAULT_POLISH_PROMPT
     sign_translation_prompt: str = DEFAULT_SIGN_TRANSLATION_PROMPT
     song_translation_prompt: str = DEFAULT_SONG_TRANSLATION_PROMPT
+    analyze_prompt: str = DEFAULT_ANALYZE_PROMPT
+    mapping_prompt: str = DEFAULT_MAPPING_PROMPT
+    style_bible_prompt: str = DEFAULT_STYLE_BIBLE_PROMPT
+    style_bible_update_prompt: str = DEFAULT_STYLE_BIBLE_UPDATE_PROMPT
 
     @classmethod
     def from_dict(cls, d: dict[str, str | None]) -> "AppOptions":
@@ -85,6 +96,8 @@ class AppOptions:
             target_lang_code=d.get("TARGET_LANG_CODE"),
             chunk_size=int(raw_chunk_size) if raw_chunk_size is not None else 100,
             prepend_context_size=int(raw_context_size) if raw_context_size is not None else 10,
+            lookahead_context_size=_validated_non_negative_int(
+                d.get("LOOKAHEAD_CONTEXT_SIZE"), "LOOKAHEAD_CONTEXT_SIZE", 5),
             openai_api_base=d.get("OPENAI_API_BASE") or "https://api.openai.com/v1",
             openai_api_key=d.get("OPENAI_API_KEY"),
             openai_model_cheap=d.get("OPENAI_MODEL_CHEAP") or "gpt-5.4-mini",
@@ -111,6 +124,11 @@ class AppOptions:
             polish_prompt=d.get("POLISH_PROMPT") or DEFAULT_POLISH_PROMPT,
             sign_translation_prompt=d.get("SIGN_TRANSLATION_PROMPT") or DEFAULT_SIGN_TRANSLATION_PROMPT,
             song_translation_prompt=d.get("SONG_TRANSLATION_PROMPT") or DEFAULT_SONG_TRANSLATION_PROMPT,
+            analyze_prompt=d.get("ANALYZE_PROMPT") or DEFAULT_ANALYZE_PROMPT,
+            mapping_prompt=d.get("MAPPING_PROMPT") or DEFAULT_MAPPING_PROMPT,
+            style_bible_prompt=d.get("STYLE_BIBLE_PROMPT") or DEFAULT_STYLE_BIBLE_PROMPT,
+            style_bible_update_prompt=(
+                d.get("STYLE_BIBLE_UPDATE_PROMPT") or DEFAULT_STYLE_BIBLE_UPDATE_PROMPT),
         )
 
     def _resolve(self, prompt: str) -> str:
@@ -131,6 +149,20 @@ class AppOptions:
 
     def resolved_song_translation_prompt(self) -> str:
         return self._resolve(self.song_translation_prompt)
+
+    def resolved_analyze_prompt(self) -> str:
+        return self._resolve(self.analyze_prompt)
+
+    def resolved_mapping_prompt(self) -> str:
+        # Language-neutral by design — resolved anyway so a user-supplied
+        # prompt may use the placeholder if they want to.
+        return self._resolve(self.mapping_prompt)
+
+    def resolved_style_bible_prompt(self) -> str:
+        return self._resolve(self.style_bible_prompt)
+
+    def resolved_style_bible_update_prompt(self) -> str:
+        return self._resolve(self.style_bible_update_prompt)
 
 
 # -- Validation helpers --------------------------------------------------------
@@ -181,6 +213,21 @@ def _validated_positive_int(raw: str | None, name: str, default: int) -> int:
         return default
     if value <= 0:
         _logger.warning("%s must be > 0, got %d, falling back to %d", name, value, default)
+        return default
+    return value
+
+
+def _validated_non_negative_int(raw: str | None, name: str, default: int) -> int:
+    """Like _validated_positive_int but 0 is a legal value (feature off)."""
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning("Invalid %s %r, falling back to %d", name, raw, default)
+        return default
+    if value < 0:
+        _logger.warning("%s must be >= 0, got %d, falling back to %d", name, value, default)
         return default
     return value
 

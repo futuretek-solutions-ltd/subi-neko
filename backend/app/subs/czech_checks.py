@@ -1,8 +1,9 @@
 """Deterministic Czech-quality and readability flaggers.
 
-These run in review_chunk_final after the polish pass. They are *flaggers*,
-never auto-fixers: a hit either routes the line into the targeted polish
-re-pass (first time) or surfaces as a warning QaItem for the reviewer.
+Most run in review_chunk_final after the polish pass; check_polish_drift runs
+inside polish_chunk, on the pass's own before/after pairs. They are
+*flaggers*, never auto-fixers: a hit either routes the line into the targeted
+polish re-pass (first time) or surfaces as a warning QaItem for the reviewer.
 
 Czech grammar tooling is not available, so these checks are deliberately
 narrow, high-precision patterns rather than a grammar model.
@@ -26,41 +27,94 @@ Finding = tuple[str, str, dict]
 # in both orders ("viděl jsem" and "jsem viděl").
 # ---------------------------------------------------------------------------
 
-_PARTICIPLE_BEFORE_AUX = re.compile(
-    r"\b([\w]{2,}?)(la|lo|li|ly|l)\s+(?:jsem|bych)\b", re.IGNORECASE | re.UNICODE)
-_PARTICIPLE_AFTER_AUX = re.compile(
-    r"\b(?:jsem|bych)\s+(?:se\s+|si\s+)?([\w]{2,}?)(la|lo|li|ly|l)\b", re.IGNORECASE | re.UNICODE)
+# Short words that routinely sit between the auxiliary and its participle
+# ("jsem to udělal", "jsi se jí zeptal", "jsi mi to neřekla"). They are all
+# clitics or short pronouns, so whatever follows the run is still the
+# participle — allowing a couple of them is what makes the check fire on
+# ordinary word order instead of only the textbook case.
+_INTERVENING_CLITICS = "se|si|to|ho|mu|mi|ti|ji|jí|mě|tě|je|tam|už|ještě|nikdy"
+
+
+def _participle_patterns(auxiliaries: str) -> tuple[re.Pattern, re.Pattern]:
+    return (
+        re.compile(rf"\b([\w]{{2,}}?)(la|lo|li|ly|l)\s+(?:{auxiliaries})\b",
+                   re.IGNORECASE | re.UNICODE),
+        re.compile(
+            rf"\b(?:{auxiliaries})\s+(?:(?:{_INTERVENING_CLITICS})\s+){{0,2}}"
+            rf"([\w]{{2,}}?)(la|lo|li|ly|l)\b",
+            re.IGNORECASE | re.UNICODE),
+    )
+
+
+# 1st person singular — the participle agrees with the SPEAKER.
+_PARTICIPLE_BEFORE_AUX, _PARTICIPLE_AFTER_AUX = _participle_patterns("jsem|bych")
+
+# 2nd person singular — the participle agrees with the ADDRESSEE. At least as
+# common in dialogue as the first person ("byl jsi" / "byla jsi"), and the
+# error is invisible to the speaker-gender check above.
+_PARTICIPLE_BEFORE_AUX_2SG, _PARTICIPLE_AFTER_AUX_2SG = _participle_patterns("jsi|bys")
+
+
+def _participle_candidates(text: str, patterns: tuple[re.Pattern, re.Pattern]) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []  # (word, ending)
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            candidates.append((match.group(1) + match.group(2), match.group(2).lower()))
+    return candidates
+
+
+def _agreement_finding(
+    candidates: list[tuple[str, str]],
+    gender: str,
+    message: str,
+    details: dict,
+) -> list[Finding]:
+    if not candidates:
+        return []
+
+    expected = "l" if gender == "male" else "la"
+    wrong = "la" if gender == "male" else "l"
+
+    # A noun ending in -l/-la can sit next to the auxiliary ("stůl jsem
+    # koupila"), so only flag when NO correctly-gendered participle candidate
+    # exists — precision over recall.
+    has_correct = any(ending == expected for _, ending in candidates)
+    mismatched = [word for word, ending in candidates if ending == wrong]
+
+    if mismatched and not has_correct:
+        return [("gender_agreement", message, {**details, "words": mismatched[:5]})]
+    return []
 
 
 def check_gender_agreement(translated: str, speaker_gender: str | None) -> list[Finding]:
     if speaker_gender not in ("male", "female"):
         return []
-    text = plain_text(translated)
+    return _agreement_finding(
+        _participle_candidates(plain_text(translated),
+                               (_PARTICIPLE_BEFORE_AUX, _PARTICIPLE_AFTER_AUX)),
+        speaker_gender,
+        f"Past-tense form does not match speaker gender ({speaker_gender}).",
+        {"speaker_gender": speaker_gender, "person": "speaker"},
+    )
 
-    candidates: list[tuple[str, str]] = []  # (word, ending)
-    for pattern in (_PARTICIPLE_BEFORE_AUX, _PARTICIPLE_AFTER_AUX):
-        for match in pattern.finditer(text):
-            candidates.append((match.group(1) + match.group(2), match.group(2).lower()))
 
-    if not candidates:
+def check_addressee_gender_agreement(
+    translated: str, addressee_gender: str | None, addressee: str | None = None,
+) -> list[Finding]:
+    """Second-person past-tense agreement against the gender of the person
+    being addressed ("byl jsi" to a woman). The addressee is identified from
+    the line itself — see infer_addressee."""
+    if addressee_gender not in ("male", "female"):
         return []
-
-    expected = "l" if speaker_gender == "male" else "la"
-    wrong = "la" if speaker_gender == "male" else "l"
-
-    # A noun ending in -l/-la can sit next to "jsem" ("stůl jsem koupila"),
-    # so only flag when NO correctly-gendered participle candidate exists —
-    # precision over recall.
-    has_correct = any(ending == expected for _, ending in candidates)
-    mismatched = [word for word, ending in candidates if ending == wrong]
-
-    if mismatched and not has_correct:
-        return [(
-            "gender_agreement",
-            f"Past-tense form does not match speaker gender ({speaker_gender}).",
-            {"speaker_gender": speaker_gender, "words": mismatched[:5]},
-        )]
-    return []
+    who = f" ({addressee})" if addressee else ""
+    return _agreement_finding(
+        _participle_candidates(plain_text(translated),
+                               (_PARTICIPLE_BEFORE_AUX_2SG, _PARTICIPLE_AFTER_AUX_2SG)),
+        addressee_gender,
+        f"Second-person past-tense form does not match the gender of the "
+        f"person being addressed{who}: {addressee_gender}.",
+        {"addressee_gender": addressee_gender, "addressee": addressee, "person": "addressee"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +141,17 @@ def check_tv_mixed_in_line(translated: str) -> list[Finding]:
     return []
 
 
-def check_tv_against_pairs(translated: str, speaker_pair_modes: set[str]) -> list[Finding]:
-    """Compare a line's T/V markers against the speaker's stored address
-    pairs. Only fires when the speaker addresses EVERYONE the same way
-    (uniform mode) — a speaker with mixed relationships can't be checked
-    without per-line addressee attribution."""
+def check_tv_against_pairs(
+    translated: str, speaker_pair_modes: set[str], addressee: str | None = None,
+) -> list[Finding]:
+    """Compare a line's T/V markers against the stored address pairs.
+
+    With an `addressee` the modes are that exact speaker→addressee pair, which
+    is the case worth checking: a speaker with mixed relationships is only
+    inconsistent relative to one particular person. Without one the caller has
+    fallen back to the speaker's uniform mode, which can only be checked when
+    they address EVERYONE the same way.
+    """
     if speaker_pair_modes not in ({"tykani"}, {"vykani"}):
         return []
     expected = next(iter(speaker_pair_modes))
@@ -101,16 +161,20 @@ def check_tv_against_pairs(translated: str, speaker_pair_modes: set[str]) -> lis
     v_hits = _V_MARKERS.findall(text)
 
     if expected == "tykani" and v_hits and not t_hits:
+        whom = (f"toward {addressee}, whom this speaker addresses informally"
+                if addressee else "by a speaker who addresses everyone informally")
         return [(
             "tv_address_mismatch",
-            "Formal address (vykání) used by a speaker who addresses everyone informally.",
-            {"expected": expected, "found": v_hits[:3]},
+            f"Formal address (vykání) used {whom}.",
+            {"expected": expected, "found": v_hits[:3], "addressee": addressee},
         )]
     if expected == "vykani" and t_hits and not v_hits:
+        whom = (f"toward {addressee}, whom this speaker addresses formally"
+                if addressee else "by a speaker who addresses everyone formally")
         return [(
             "tv_address_mismatch",
-            "Informal address (tykání) used by a speaker who addresses everyone formally.",
-            {"expected": expected, "found": t_hits[:3]},
+            f"Informal address (tykání) used {whom}.",
+            {"expected": expected, "found": t_hits[:3], "addressee": addressee},
         )]
     return []
 
@@ -120,6 +184,35 @@ def check_tv_against_pairs(translated: str, speaker_pair_modes: set[str]) -> lis
 # vocative form ("Ahoj, Tomáši!" not "Ahoj, Tomáš!")
 # ---------------------------------------------------------------------------
 
+def _direct_address_pattern(name: str) -> re.Pattern:
+    """Line-initial "Name, …"/"Name!" or after a comma "…, Name." — the
+    positions where a name is being used to address someone rather than to
+    talk about them."""
+    return re.compile(rf"(?:^|,\s+){re.escape(name)}(?:\s*[,.!?…]|$)", re.IGNORECASE)
+
+
+def infer_addressee(translated: str, name_forms: dict[str, str]) -> str | None:
+    """Who this line is spoken TO, when the line says so itself.
+
+    name_forms maps a surface form (nominative or vocative, casefolded by the
+    caller's construction) to the canonical name. Returns the canonical name
+    of the first form found in a direct-address position, else None.
+
+    This deliberately reads the translated text rather than the event's
+    speaker field: real-world ASS files often carry no speaker attribution at
+    all, but a line that addresses someone by name says so in the text.
+    """
+    text = plain_text(translated)
+    best: tuple[int, str] | None = None
+    for form, canonical in name_forms.items():
+        if not form:
+            continue
+        match = _direct_address_pattern(form).search(text)
+        if match is not None and (best is None or match.start() < best[0]):
+            best = (match.start(), canonical)
+    return best[1] if best is not None else None
+
+
 def check_vocative(translated: str, vocatives: dict[str, str]) -> list[Finding]:
     """vocatives: nominative name → vocative form (from the glossary).
     Flags the nominative appearing in a direct-address position."""
@@ -128,8 +221,6 @@ def check_vocative(translated: str, vocatives: dict[str, str]) -> list[Finding]:
     for name, vocative in vocatives.items():
         if not name or not vocative or name == vocative:
             continue
-        # Direct-address positions: line-initial "Name, …"/"Name!" or
-        # after a comma "…, Name." / "…, Name," / "…, Name!"
         pattern = re.compile(
             rf"(?:^|,\s+){re.escape(name)}(?:\s*[,.!?…]|$)"
         )
@@ -256,3 +347,90 @@ def check_untranslated_english(
             },
         )]
     return []
+
+
+# ---------------------------------------------------------------------------
+# Polish drift — did the rewrite change what the line MEANS?
+#
+# The polish pass runs the better model over every translated line and may
+# rewrite it freely. Nothing downstream checks that meaning survived:
+# validate_chunk is markup-only and the checks above are surface-level. These
+# four signals are the cheap, deterministic part of that gap — they do not
+# judge style, only flag rewrites that changed something a rewrite has no
+# business changing.
+# ---------------------------------------------------------------------------
+
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+# Czech negation is overwhelmingly the verbal prefix "ne-", plus a small set
+# of negative pronouns/adverbs. Counting occurrences is a coarse but stable
+# proxy: a genuine rephrasing usually preserves the count ("Nevím" ->
+# "Netuším"), while dropping or adding a negation changes it.
+_NEGATION_RE = re.compile(
+    r"\b(?:ne\w+|ne|ni(?:kdy|c|kdo|jak|kam|kde)|ani|žádn\w*)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Below this many visible characters, a large relative length change is not
+# evidence of anything — one word in a three-word line moves it.
+_DRIFT_MIN_LENGTH = 20
+_DRIFT_LENGTH_RATIO = 0.6
+
+
+def check_polish_drift(
+    before: str,
+    after: str,
+    reason: str | None = None,
+    glossary_targets: list[str] | None = None,
+) -> list[Finding]:
+    """Compare a polish edit's before/after for meaning-bearing changes."""
+    old = plain_text(before or "")
+    new = plain_text(after or "")
+    if not old.strip() or not new.strip():
+        return []
+
+    reasons: list[str] = []
+    details: dict = {}
+
+    old_digits = _DIGIT_RUN_RE.findall(old)
+    new_digits = _DIGIT_RUN_RE.findall(new)
+    if sorted(old_digits) != sorted(new_digits):
+        reasons.append("numbers_changed")
+        details["numbers"] = {"before": old_digits, "after": new_digits}
+
+    old_neg = len(_NEGATION_RE.findall(old))
+    new_neg = len(_NEGATION_RE.findall(new))
+    if old_neg != new_neg:
+        reasons.append("negation_changed")
+        details["negation_count"] = {"before": old_neg, "after": new_neg}
+
+    dropped = [
+        term for term in (glossary_targets or [])
+        if term and term.casefold() in old.casefold()
+        and term.casefold() not in new.casefold()
+    ]
+    if dropped:
+        reasons.append("glossary_term_dropped")
+        details["dropped_terms"] = dropped[:5]
+
+    # A length rule would double-report an edit the model itself labelled as
+    # condensing, which is the one case where a big change is the point.
+    if reason != "length" and max(len(old), len(new)) >= _DRIFT_MIN_LENGTH:
+        change = abs(len(new) - len(old)) / max(len(old), 1)
+        if change > _DRIFT_LENGTH_RATIO:
+            reasons.append("length_jump")
+            details["length"] = {"before": len(old), "after": len(new),
+                                 "change": round(change, 2)}
+
+    if not reasons:
+        return []
+
+    details["reasons"] = reasons
+    details["before"] = old
+    details["after"] = new
+    return [(
+        "polish_drift",
+        "Polish edit may have changed the meaning of the line ("
+        + ", ".join(reasons) + ").",
+        details,
+    )]

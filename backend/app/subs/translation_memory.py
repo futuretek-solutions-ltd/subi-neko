@@ -44,6 +44,8 @@ class TmMatch:
     origin: str          # human | ai
     exact_raw: bool      # raw source_text identical → safe to auto-apply
     entry_id: int
+    score: float = 100.0    # similarity of the TM source to the looked-up line
+    tm_source_text: str = ""  # the TM entry's own source, for approximate hints
 
 
 def populate_from_file(session: Session, project_id: int, file_id: int, now: str | None = None) -> int:
@@ -225,6 +227,8 @@ def lookup(
             origin=row.origin,
             exact_raw=(row.source_text == source_texts[line_index]),
             entry_id=row.id,
+            score=100.0,
+            tm_source_text=row.source_text,
         )
     return matches
 
@@ -234,6 +238,35 @@ def lookup(
 _FUZZY_SCORE_CUTOFF = 92.0
 _FUZZY_MAX_TM_ENTRIES = 20_000
 _FUZZY_MIN_LENGTH = 12  # short lines fuzzy-match everything — not useful
+
+# Tokens whose presence on one side only flips the meaning of an otherwise
+# near-identical line. At the 92 % cutoff a short line can differ by exactly
+# one of these ("I can do it." vs "I can't do it." scores ~92), so a match
+# that hinges on one is rejected outright rather than offered as a hint:
+# a missing suggestion costs nothing, a meaning-inverting one is expensive.
+_MEANING_FLIPPING_TOKENS = {
+    "not", "n't", "no", "never", "none", "nothing", "nobody", "nowhere",
+    "cannot", "can't", "cant", "don't", "dont", "doesn't", "doesnt",
+    "didn't", "didnt", "won't", "wont", "isn't", "isnt", "aren't", "arent",
+    "wasn't", "wasnt", "weren't", "werent", "shouldn't", "shouldnt",
+    "couldn't", "couldnt", "wouldn't", "wouldnt", "haven't", "havent",
+    "hasn't", "hasnt", "hadn't", "hadnt", "ain't", "aint",
+    "always", "every", "all", "any", "neither", "nor",
+}
+
+_TOKEN_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)?", re.UNICODE)
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _meaning_may_differ(left: str, right: str) -> bool:
+    """True when two near-identical normalized sources differ in a way that
+    can invert or re-quantify the statement — a negation/quantifier present
+    on one side only, or a different set of numbers."""
+    left_tokens = set(_TOKEN_RE.findall(left))
+    right_tokens = set(_TOKEN_RE.findall(right))
+    if (left_tokens ^ right_tokens) & _MEANING_FLIPPING_TOKENS:
+        return True
+    return set(_DIGITS_RE.findall(left)) != set(_DIGITS_RE.findall(right))
 
 
 def fuzzy_suggest(
@@ -270,15 +303,19 @@ def fuzzy_suggest(
         )
         if best is None:
             continue
-        _choice, score, index = best
+        choice, score, index = best
         row = rows[index]
         if score >= 100.0:
             continue  # exact normalized match — the exact lookup owns these
+        if _meaning_may_differ(normalized, choice):
+            continue
         matches[line_index] = TmMatch(
             target_text=row.target_text,
             origin=row.origin,
             exact_raw=False,
             entry_id=row.id,
+            score=score,
+            tm_source_text=row.source_text,
         )
     return matches
 

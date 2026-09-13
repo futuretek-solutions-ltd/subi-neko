@@ -27,6 +27,7 @@ async def get_options() -> dict[str, str | None]:
         "TARGET_LANG_CODE": opts.target_lang_code,
         "CHUNK_SIZE": str(opts.chunk_size),
         "PREPEND_CONTEXT_SIZE": str(opts.prepend_context_size),
+        "LOOKAHEAD_CONTEXT_SIZE": str(opts.lookahead_context_size),
         "OPENAI_API_BASE": opts.openai_api_base,
         "OPENAI_API_KEY": _mask_secret(opts.openai_api_key),
         "OPENAI_MODEL_CHEAP": opts.openai_model_cheap,
@@ -49,6 +50,10 @@ async def get_options() -> dict[str, str | None]:
         "POLISH_PROMPT": opts.polish_prompt,
         "SIGN_TRANSLATION_PROMPT": opts.sign_translation_prompt,
         "SONG_TRANSLATION_PROMPT": opts.song_translation_prompt,
+        "ANALYZE_PROMPT": opts.analyze_prompt,
+        "MAPPING_PROMPT": opts.mapping_prompt,
+        "STYLE_BIBLE_PROMPT": opts.style_bible_prompt,
+        "STYLE_BIBLE_UPDATE_PROMPT": opts.style_bible_update_prompt,
     }
 
 

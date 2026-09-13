@@ -146,6 +146,64 @@ def test_fuzzy_suggest_finds_near_match(session_factory):
         assert matches[7].exact_raw is False  # suggestion only, never auto-applied
 
 
+def test_fuzzy_suggest_reports_score_and_its_own_source(session_factory):
+    with session_factory() as session:
+        project_id, file_id = _make_project_file(session)
+        _add_event(session, file_id, 0, "I will never give up on you!", "Nikdy se tě nevzdám!")
+        tm.populate_from_file(session, project_id, file_id)
+        session.commit()
+
+        match = tm.fuzzy_suggest(session, project_id, {7: "I will never give up on you..."})[7]
+        # The hint is rendered with both, so the model can see what it is
+        # being offered and how far it is from the line it must translate.
+        assert match.score < 100.0
+        assert match.tm_source_text == "I will never give up on you!"
+
+
+def test_lookup_reports_full_score_and_source(session_factory):
+    with session_factory() as session:
+        project_id, file_id = _make_project_file(session)
+        _add_event(session, file_id, 0, "Good morning!", "Dobré ráno!")
+        tm.populate_from_file(session, project_id, file_id)
+        session.commit()
+
+        match = tm.lookup(session, project_id, {3: "Good morning!"})[3]
+        assert match.score == 100.0
+        assert match.tm_source_text == "Good morning!"
+
+
+def test_fuzzy_suggest_rejects_negation_flip(session_factory):
+    """A negation present on one side only inverts the line, and at the 92 %
+    cutoff that can be the ONLY difference — the match must be dropped."""
+    from rapidfuzz import fuzz
+
+    stored = "I can do it on my own, you know."
+    queried = "I can't do it on my own, you know."
+
+    # Guard the guard: without the negation check this pair scores high
+    # enough to be offered, so the assertion below really tests the filter.
+    assert fuzz.ratio(tm.normalize_source(stored), tm.normalize_source(queried)) >= 92.0
+
+    with session_factory() as session:
+        project_id, file_id = _make_project_file(session)
+        _add_event(session, file_id, 0, stored, "Zvládnu to sám, víš.")
+        tm.populate_from_file(session, project_id, file_id)
+        session.commit()
+
+        assert tm.fuzzy_suggest(session, project_id, {5: queried}) == {}
+
+
+def test_fuzzy_suggest_rejects_changed_numbers(session_factory):
+    with session_factory() as session:
+        project_id, file_id = _make_project_file(session)
+        _add_event(session, file_id, 0, "We have to hold out for 12 more days.", "Musíme vydržet ještě 12 dní.")
+        tm.populate_from_file(session, project_id, file_id)
+        session.commit()
+
+        assert tm.fuzzy_suggest(
+            session, project_id, {5: "We have to hold out for 13 more days."}) == {}
+
+
 def test_fuzzy_suggest_ignores_dissimilar_and_short_lines(session_factory):
     with session_factory() as session:
         project_id, file_id = _make_project_file(session)

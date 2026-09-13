@@ -3,7 +3,7 @@ budget floor, and cryptic speaker-label guards."""
 from __future__ import annotations
 
 from app.jobs.handlers.infer_character_mapping import is_cryptic_label
-from app.jobs.handlers.polish_chunk import _char_budget
+from app.jobs.handlers.prompt_context import char_budget
 from app.jobs.handlers.translate_chunk import _detect_sign_fragments
 
 
@@ -97,19 +97,19 @@ def test_mixed_duplicate_and_continuation_still_fragments():
 
 def test_char_budget_normal_dialogue():
     # 3 s at 20 CPS → 60 chars.
-    assert _char_budget(0, 3000, 20.0) == 60
+    assert char_budget(0, 3000, 20.0) == 60
 
 
 def test_char_budget_floors_to_none_for_short_events():
     # 40 ms sign frame at 20 CPS must not become "max 0 chars".
-    assert _char_budget(0, 40, 20.0) is None
-    assert _char_budget(0, 50, 20.0) is None
-    assert _char_budget(0, 450, 20.0) is None  # 9 chars — below the floor
+    assert char_budget(0, 40, 20.0) is None
+    assert char_budget(0, 50, 20.0) is None
+    assert char_budget(0, 450, 20.0) is None  # 9 chars — below the floor
 
 
 def test_char_budget_zero_duration():
-    assert _char_budget(1000, 1000, 20.0) is None
-    assert _char_budget(1000, 900, 20.0) is None
+    assert char_budget(1000, 1000, 20.0) is None
+    assert char_budget(1000, 900, 20.0) is None
 
 
 # --- cryptic speaker labels --------------------------------------------------

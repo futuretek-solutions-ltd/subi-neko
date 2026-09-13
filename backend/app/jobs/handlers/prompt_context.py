@@ -17,6 +17,7 @@ from app.db.models import (
     ProjectGlossaryTerm,
     ProjectSpeaker,
     ProjectStyleBible,
+    SubtitleEvent,
 )
 from app.subs.tag_masking import plain_text
 
@@ -25,6 +26,99 @@ from app.subs.tag_masking import plain_text
 _NON_SPEAKING_CHARACTER_TYPES = {"organization", "vessel"}
 
 _DESCRIPTION_MAX_LEN = 200
+
+
+def load_preceding_context_events(
+    session: Session,
+    file_id: int,
+    content_type: str,
+    before_line: int,
+    limit: int,
+) -> list[SubtitleEvent]:
+    """The last `limit` events before `before_line`, in chronological order,
+    restricted to one content_type partition.
+
+    The window is deliberately NOT cross-partition. Chunks are scheduled per
+    partition (dialogue is a gated sequential chain; signs/karaoke/songs run
+    in parallel), so lines from another partition are usually still
+    untranslated at this point — they would occupy context slots with
+    source-only rows and crowd out the translated context the window exists
+    to provide. Within the partition the ordering guarantees hold.
+    """
+    if limit <= 0:
+        return []
+    rows = list(session.scalars(
+        select(SubtitleEvent)
+        .where(SubtitleEvent.file_id == file_id)
+        .where(SubtitleEvent.event_type == "dialogue")
+        .where(SubtitleEvent.content_type == content_type)
+        .where(SubtitleEvent.line_index < before_line)
+        .order_by(SubtitleEvent.line_index.desc())
+        .limit(limit)
+    ).all())
+    rows.reverse()
+    return rows
+
+
+def load_following_context_events(
+    session: Session,
+    file_id: int,
+    content_type: str,
+    after_line: int,
+    limit: int,
+) -> list[SubtitleEvent]:
+    """The first `limit` events after `after_line`, in chronological order,
+    restricted to one content_type partition.
+
+    The mirror image of load_preceding_context_events, and the reason the two
+    are not one function: these lines are almost always still untranslated
+    (the dialogue chain translates strictly forward), so callers render them
+    as source-only lookahead. Without it the last lines of every chunk are
+    translated blind to what follows — the setup of a joke whose punchline
+    is in the next chunk, a question whose answer fixes the register.
+    """
+    if limit <= 0:
+        return []
+    return list(session.scalars(
+        select(SubtitleEvent)
+        .where(SubtitleEvent.file_id == file_id)
+        .where(SubtitleEvent.event_type == "dialogue")
+        .where(SubtitleEvent.content_type == content_type)
+        .where(SubtitleEvent.line_index > after_line)
+        .order_by(SubtitleEvent.line_index)
+        .limit(limit)
+    ).all())
+
+
+def build_lookahead_lines(events: list[SubtitleEvent]) -> list[str]:
+    """Source-only [AHEAD] rows for the lines that follow a chunk."""
+    lines = []
+    for e in events:
+        text = plain_text(e.source_text)
+        if not text:
+            continue
+        lines.append(f"[AHEAD] {e.line_index}: {text}")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Reading-speed budget
+# ---------------------------------------------------------------------------
+
+# Below this the CPS-derived budget is unsatisfiable noise ("max 0 chars"
+# for a 40 ms sign frame) — omit the constraint and let the deterministic
+# readability check flag real CPS problems after the fact.
+MIN_CHAR_BUDGET = 10
+
+
+def char_budget(start_ms: int, end_ms: int, cps_limit: float) -> int | None:
+    """Characters that fit in the line's on-screen time at the CPS limit,
+    or None when the duration makes the number meaningless."""
+    duration_ms = end_ms - start_ms
+    if duration_ms <= 0:
+        return None
+    budget = int(cps_limit * duration_ms / 1000.0)
+    return budget if budget >= MIN_CHAR_BUDGET else None
 
 
 def load_prompt_characters(session: Session, project_id: int) -> list[ProjectCharacter]:
@@ -131,18 +225,25 @@ def load_glossary_terms(session: Session, project_id: int) -> list[ProjectGlossa
 def build_glossary_block(terms: list[ProjectGlossaryTerm], chunk_texts: list[str]) -> str:
     """Names/places always; other categories only when the term occurs in
     the chunk's source text. Capped so a huge glossary can't flood the
-    prompt (always-included categories win the budget)."""
+    prompt — and the cap is applied to the two groups separately, because
+    `terms` arrives ordered by category: a plain slice would drop 'name' and
+    'place' (alphabetically late) in favour of matched 'honorific'/'item'
+    rows, evicting exactly the terms that must never drift."""
     combined = " ".join(plain_text(t) for t in chunk_texts).casefold()
 
-    selected: list[ProjectGlossaryTerm] = []
+    always: list[ProjectGlossaryTerm] = []
+    matched: list[ProjectGlossaryTerm] = []
     for term in terms:
         if term.category in _ALWAYS_INCLUDED_CATEGORIES:
-            selected.append(term)
+            always.append(term)
         elif term.source_term.casefold() in combined:
-            selected.append(term)
+            matched.append(term)
+
+    selected = always[:_MAX_GLOSSARY_LINES]
+    selected += matched[:max(0, _MAX_GLOSSARY_LINES - len(selected))]
 
     lines = []
-    for term in selected[:_MAX_GLOSSARY_LINES]:
+    for term in selected:
         extras = []
         if term.vocative:
             extras.append(f"vocative: {term.vocative}")

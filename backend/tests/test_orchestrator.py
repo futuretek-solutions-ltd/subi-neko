@@ -448,7 +448,7 @@ class TestChunkOrchestrator:
 
     @pytest.mark.asyncio
     async def test_sequential_gating_holds_second_pending_chunk(self, db_session, enqueue_mock):
-        """Chunk N must not translate until chunk N-1 has left 'pending'."""
+        """Chunk N must not translate until chunk N-1 has been polished."""
         from app.orchestrator.chunk_orchestrator import orchestrate_chunks
 
         project = await _create_project(db_session, status="processing")
@@ -466,19 +466,124 @@ class TestChunkOrchestrator:
         assert call_kwargs["dedupe_key"] == f"translate_chunk:{file.id}:0"
 
     @pytest.mark.asyncio
-    async def test_sequential_gating_releases_after_previous_translated(self, db_session, enqueue_mock):
+    @pytest.mark.parametrize(
+        "previous_status,expected_job",
+        [
+            ("translated", "validate_chunk"),
+            ("validate_trans_failed", "repair_chunk"),
+            ("validated", "polish_chunk"),
+        ],
+    )
+    async def test_sequential_gating_holds_until_previous_polished(
+        self, db_session, enqueue_mock, previous_status, expected_job,
+    ):
+        """A translated-but-unpolished predecessor still blocks chunk N: its
+        wording is a draft the polish pass is about to rewrite."""
         from app.orchestrator.chunk_orchestrator import orchestrate_chunks
 
         project = await _create_project(db_session, status="processing")
         file = await _create_file(db_session, project.id, status="processing")
-        await _create_chunk(db_session, file.id, 0, status="translated")
+        await _create_chunk(db_session, file.id, 0, status=previous_status)
+        await _create_chunk(db_session, file.id, 1, status="pending")
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        enqueue_mock.assert_called_once()
+        assert enqueue_mock.call_args.kwargs["job_type"] == expected_job
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "previous_status,expected_job",
+        [
+            ("polished", "review_chunk_final"),
+            # The full-coverage pass has run; the targeted re-polish only
+            # revisits a handful of flagged lines, so it does not hold N back.
+            ("needs_polish", "polish_chunk"),
+        ],
+    )
+    async def test_sequential_gating_releases_after_previous_polished(
+        self, db_session, enqueue_mock, previous_status, expected_job,
+    ):
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status=previous_status)
         await _create_chunk(db_session, file.id, 1, status="pending")
 
         result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
 
         assert result is False
         job_types = {c.kwargs["job_type"] for c in enqueue_mock.call_args_list}
-        assert job_types == {"validate_chunk", "translate_chunk"}
+        assert job_types == {expected_job, "translate_chunk"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["sign", "song"])
+    async def test_non_dialogue_partitions_translate_in_parallel(
+        self, db_session, enqueue_mock, content_type,
+    ):
+        """Signs and songs carry no conversational continuity — serializing
+        them would only cost wall clock."""
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="pending", content_type=content_type)
+        await _create_chunk(db_session, file.id, 1, status="pending", content_type=content_type)
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        keys = {c.kwargs["dedupe_key"] for c in enqueue_mock.call_args_list}
+        assert keys == {
+            f"translate_chunk:{file.id}:0",
+            f"translate_chunk:{file.id}:1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_sign_partition_not_gated_by_unpolished_dialogue(self, db_session, enqueue_mock):
+        """The partitions are contiguous in chunk_index space, so the first
+        sign chunk sits right behind the last dialogue chunk — it must not
+        inherit the dialogue chain's polish gate."""
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="translated", content_type="dialogue")
+        await _create_chunk(db_session, file.id, 1, status="pending", content_type="sign")
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        keys = {c.kwargs["dedupe_key"] for c in enqueue_mock.call_args_list}
+        assert keys == {
+            f"validate_chunk:{file.id}:0",
+            f"translate_chunk:{file.id}:1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_dialogue_gate_skips_over_interleaved_sign_chunk(self, db_session, enqueue_mock):
+        """The gate tracks the previous chunk per partition, so an
+        interleaved sign chunk neither opens nor closes the dialogue gate."""
+        from app.orchestrator.chunk_orchestrator import orchestrate_chunks
+
+        project = await _create_project(db_session, status="processing")
+        file = await _create_file(db_session, project.id, status="processing")
+        await _create_chunk(db_session, file.id, 0, status="validated", content_type="dialogue")
+        await _create_chunk(db_session, file.id, 1, status="polished", content_type="sign")
+        await _create_chunk(db_session, file.id, 2, status="pending", content_type="dialogue")
+
+        result = await orchestrate_chunks(file.id, project.id, enqueue_mock)
+
+        assert result is False
+        keys = {c.kwargs["dedupe_key"] for c in enqueue_mock.call_args_list}
+        # Chunk 2 is held by the unpolished dialogue chunk 0, not released by
+        # the polished sign chunk 1 sitting between them.
+        assert keys == {
+            f"polish_chunk:{file.id}:0",
+            f"review_chunk_final:{file.id}:1",
+        }
 
     @pytest.mark.asyncio
     async def test_sequential_gating_ignores_blocked_predecessor(self, db_session, enqueue_mock):

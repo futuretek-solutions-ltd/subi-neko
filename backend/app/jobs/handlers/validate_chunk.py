@@ -218,6 +218,19 @@ def _is_json_output(text: str) -> bool:
     return isinstance(parsed, (dict, list))
 
 
+# escape_mismatch (⏎/␤ line-break count changed) is surfaced for manual
+# review rather than auto-repaired: on-screen sign/song reflow and
+# legitimate stylistic rewrites can change line-break counts without the
+# translation being wrong, unlike a genuine markup/syntax defect. It does
+# not fail the event, block chunk progression, or trigger repair_chunk;
+# AUTO_ACCEPT_POLICY (no_blockers) lets it through auto-accept too.
+_NON_BLOCKING_QA_TYPES = {"escape_mismatch"}
+
+
+def _is_blocking(qa_type: str) -> bool:
+    return qa_type not in _NON_BLOCKING_QA_TYPES
+
+
 _CHECKS = [
     _check_missing_translation,
     _check_formatting_tag_mismatch,
@@ -336,12 +349,13 @@ def validate_chunk(
             event_errors.extend(check_fn(proxy))  # type: ignore[arg-type]
 
         if event_errors:
-            failed_event_ids.add(snap["id"])
+            if any(_is_blocking(qa_type) for qa_type, _, _ in event_errors):
+                failed_event_ids.add(snap["id"])
             for qa_type, message, details in event_errors:
                 collected_errors.append(dict(
                     file_id=file_id,
                     subtitle_event_id=snap["id"],
-                    severity="blocker",
+                    severity="blocker" if _is_blocking(qa_type) else "warning",
                     qa_type=qa_type,
                     message=message,
                     details_json=json.dumps(details) if details else None,
@@ -350,7 +364,10 @@ def validate_chunk(
                 ))
 
     target_event_ids = [s["id"] for s in events_snapshot]
-    has_errors = len(collected_errors) > 0
+    # Only blocking errors reject the event / fail the chunk and drive
+    # repair_chunk — non-blocking types (see _NON_BLOCKING_QA_TYPES) still
+    # produce a QA item for review but let the chunk proceed normally.
+    has_errors = len(failed_event_ids) > 0
     error_types = sorted({e["qa_type"] for e in collected_errors})
 
     progress(0.6, f"Writing results ({len(collected_errors)} errors)")

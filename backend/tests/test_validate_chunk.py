@@ -10,6 +10,7 @@ from app.jobs.handlers.validate_chunk import (
     _checks_for_content_type,
     _check_missing_translation,
     _check_locked_line_modified,
+    _is_blocking,
 )
 
 
@@ -247,6 +248,23 @@ def test_missing_translation_ignores_markup_only_source_line():
     )
 
     assert issues == []
+
+
+def test_escape_mismatch_is_non_blocking():
+    # A dropped/added line-break can be a legitimate reflow (e.g. long sign
+    # text rewritten as prose) — it must surface for manual review but not
+    # reject the event or trigger repair_chunk, unlike a real syntax defect.
+    assert _is_blocking("escape_mismatch") is False
+
+
+def test_other_check_types_remain_blocking():
+    for qa_type in (
+        "missing_translation",
+        "formatting_tag_mismatch",
+        "locked_line_modified",
+        "text_corruption",
+    ):
+        assert _is_blocking(qa_type) is True
 
 
 def test_missing_translation_still_flags_empty_translation_of_real_text():

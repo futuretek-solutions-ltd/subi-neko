@@ -16,7 +16,6 @@ from typing import Any
 from sqlalchemy import delete, select
 
 from app.core.database import SyncSessionLocal
-from app.db.default_prompts import DEFAULT_ANALYZE_PROMPT
 from app.db.models import File, FileAnalysis, SubtitleEvent
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.handlers.prompt_context import (
@@ -31,11 +30,6 @@ from app.llm.schemas import AnalyzeResponse
 from app.subs.tag_masking import plain_text
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_prompt(prompt: str, ctx: JobContext) -> str:
-    lang = ctx.options.target_lang_name or "the target language"
-    return prompt.replace("{TARGET_LANG_NAME}", lang)
 
 
 def _previous_synopsis(session, file: File) -> str | None:
@@ -113,7 +107,7 @@ def analyze_script(
 
     progress(0.2, f"Building analysis prompt ({len(script_lines)} lines)")
 
-    system_prompt = _resolve_prompt(DEFAULT_ANALYZE_PROMPT, ctx).strip()
+    system_prompt = ctx.options.resolved_analyze_prompt().strip()
 
     user_parts = []
     if episode_line:

@@ -2,8 +2,9 @@
 
 Chunk state machine:
 
-    pending               → translate_chunk   (gated: previous chunk must
-                                               have started translating)
+    pending               → translate_chunk   (dialogue only: gated on the
+                                               previous dialogue chunk
+                                               having been polished)
     translated            → validate_chunk
     validate_trans_failed → repair_chunk      (one attempt, then terminal)
     validated             → polish_chunk      (full-coverage quality pass)
@@ -13,10 +14,20 @@ Chunk state machine:
 
 Terminal: job_failed, validate_repair_failed (require user action).
 
-Translation is serialized per file (chunk N waits until chunk N-1 left
-"pending") so each chunk can see its predecessors' finished translations as
-context. Later stages are not gated — polish of chunk N runs while chunk
-N+1 translates.
+Dialogue translation is serialized per file: dialogue chunk N waits until
+dialogue chunk N-1 has been through its polish pass, so the rolling context
+window carries the wording that actually ships rather than the cheap model's
+draft. Polish always runs for a chunk that reaches "validated" (there is no
+skip option, and even a chunk with nothing editable advances to "polished"),
+so the gate cannot deadlock on a chunk that simply had no edits.
+
+The sign, karaoke and song partitions are NOT gated — they carry no
+conversational continuity, so serializing them would only cost wall clock.
+They translate in parallel with each other and with the dialogue chain,
+bounded by the job worker pool.
+
+Stages other than translate are not gated either — review of chunk N runs
+while chunk N+1 translates.
 """
 from __future__ import annotations
 
@@ -48,6 +59,21 @@ _CHUNK_TRANSITIONS: dict[str, str] = {
 # Terminal statuses that require user action — orchestrator must not enqueue anything.
 CHUNK_TERMINAL_STATUSES = {"job_failed", "validate_repair_failed"}
 
+# Statuses a chunk holds before its polish pass has produced final wording.
+# While dialogue chunk N-1 is in one of these, dialogue chunk N must not
+# translate: its context window would quote text that polish is about to
+# rewrite. "needs_polish" is deliberately absent — the full-coverage pass has
+# already run and only a handful of flagged lines get a targeted second pass.
+_PRE_POLISH_STATUSES = {
+    "pending",
+    "translated",
+    "validate_trans_failed",
+    "validated",
+}
+
+# The only partition whose chunks depend on their predecessors' wording.
+_GATED_CONTENT_TYPE = "dialogue"
+
 
 async def orchestrate_chunks(
     file_id: int,
@@ -77,23 +103,28 @@ async def orchestrate_chunks(
     any_auto_completed = False
     has_pending_work = False
     has_blocked = False
-    previous_status: str | None = None  # status of chunk_index - 1 after this pass
+    # Status of the preceding chunk *within each content-type partition*.
+    # Only the dialogue partition is gated, but tracking per partition keeps
+    # the gate correct regardless of how plan_translation_chunks lays the
+    # partitions out in chunk_index space.
+    previous_status: dict[str, str] = {}
 
     for chunk in chunks:
         status = chunk.status
+        content_type = chunk.content_type or _GATED_CONTENT_TYPE
 
         if status == "complete":
-            previous_status = status
+            previous_status[content_type] = status
             continue
 
         # --- Terminal statuses: require user action, stop processing ---
         if status in CHUNK_TERMINAL_STATUSES:
             has_blocked = True
-            previous_status = status
+            previous_status[content_type] = status
             continue
 
         # --- Karaoke skip: keep original \k-timed lines untouched ---
-        if status == "pending" and chunk.content_type == "karaoke":
+        if status == "pending" and content_type == "karaoke":
             if translate_karaoke is None:
                 translate_karaoke = (
                     (await options_store.aget("TRANSLATE_KARAOKE", "0") or "").strip().lower()
@@ -102,24 +133,31 @@ async def orchestrate_chunks(
             if not translate_karaoke:
                 await _skip_karaoke_chunk(file_id, chunk)
                 any_auto_completed = True
-                previous_status = "complete"
+                previous_status[content_type] = "complete"
                 continue
 
         # --- final_reviewed: auto-complete ---
         if status == "final_reviewed":
             await _set_chunk_complete(file_id, chunk.chunk_index)
             any_auto_completed = True
-            previous_status = "complete"
+            previous_status[content_type] = "complete"
             continue
 
         has_pending_work = True
 
-        # --- Sequential translate gating: chunk N translates only after
-        # chunk N-1 has at least started producing translations, so the
-        # rolling context window is populated. A terminal/failed predecessor
-        # does not block (its context is simply missing). ---
-        if status == "pending" and previous_status == "pending":
-            previous_status = status
+        # --- Sequential translate gating: a dialogue chunk translates only
+        # after the previous dialogue chunk has been polished, so the rolling
+        # context window quotes the shipped wording instead of a draft polish
+        # is about to rewrite. Signs, karaoke and songs are ungated — they
+        # have no conversational continuity to preserve. A terminal/failed
+        # predecessor does not block either (its context is simply missing) —
+        # otherwise one broken chunk would wedge the whole file. ---
+        if (
+            status == "pending"
+            and content_type == _GATED_CONTENT_TYPE
+            and previous_status.get(content_type) in _PRE_POLISH_STATUSES
+        ):
+            previous_status[content_type] = status
             continue
 
         # --- Standard transitions ---
@@ -129,14 +167,14 @@ async def orchestrate_chunks(
                 "Chunk file_id=%d index=%d has unknown status '%s'",
                 file_id, chunk.chunk_index, status,
             )
-            previous_status = status
+            previous_status[content_type] = status
             continue
 
         await _ensure_chunk_job(
             enqueue_fn, job_type,
             file_id, project_id, chunk.chunk_index,
         )
-        previous_status = status
+        previous_status[content_type] = status
 
     # Blocked chunks take priority when nothing else is progressing.
     # If there's still pending work alongside blocked chunks, keep the file

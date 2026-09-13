@@ -25,14 +25,18 @@ from app.jobs.handlers.prompt_context import (
     StyleContext,
     build_character_block,
     build_glossary_block,
+    build_lookahead_lines,
     build_scene_block,
     build_speaker_identity_map,
     build_style_block,
     build_tricky_notes_block,
     build_unmapped_speaker_block,
+    char_budget,
     load_analysis_context,
     load_episode_context,
+    load_following_context_events,
     load_glossary_terms,
+    load_preceding_context_events,
     load_prompt_characters,
     load_style_context,
     load_unmapped_gendered_speakers,
@@ -41,25 +45,13 @@ from app.jobs.handlers.review_chunk_final import FINAL_REVIEW_QA_TYPES
 from app.jobs.registry import register_job_handler
 from app.llm import client as llm_client
 from app.llm.schemas import PolishResponse
+from app.subs.czech_checks import check_polish_drift
 from app.subs.tag_masking import MaskedLine, mask_line, plain_text, unmask_line
 
 logger = logging.getLogger(__name__)
 
 _CONTEXT_LINES = 5
 _VALID_ISSUE_SEVERITIES = {"warning", "info"}
-
-# Below this the CPS-derived budget is unsatisfiable noise ("max 0 chars"
-# for a 40 ms sign frame) — omit the constraint and let the deterministic
-# readability check flag real CPS problems after the fact.
-_MIN_CHAR_BUDGET = 10
-
-
-def _char_budget(start_ms: int, end_ms: int, cps_limit: float) -> int | None:
-    duration_ms = end_ms - start_ms
-    if duration_ms <= 0:
-        return None
-    budget = int(cps_limit * duration_ms / 1000.0)
-    return budget if budget >= _MIN_CHAR_BUDGET else None
 
 
 def _identity_suffix(identity: tuple[str | None, str | None]) -> str:
@@ -166,16 +158,12 @@ def polish_chunk(
                 if line is not None:
                     fix_notes.setdefault(line, []).append(f"{qa.qa_type}: {qa.message}")
 
-        # Preceding lines (any content type) as continuity context.
-        context_rows = list(session.scalars(
-            select(SubtitleEvent)
-            .where(SubtitleEvent.file_id == file_id)
-            .where(SubtitleEvent.event_type == "dialogue")
-            .where(SubtitleEvent.line_index < translate_from)
-            .order_by(SubtitleEvent.line_index.desc())
-            .limit(_CONTEXT_LINES)
-        ).all())
-        context_rows.reverse()
+        # Preceding lines of this chunk's own partition as continuity context.
+        context_rows = load_preceding_context_events(
+            session, file_id, content_type,
+            before_line=translate_from,
+            limit=_CONTEXT_LINES,
+        )
         ctx_snapshot = [
             {
                 "line_index": e.line_index,
@@ -185,6 +173,14 @@ def polish_chunk(
             }
             for e in context_rows
         ]
+
+        # Source-only lookahead — the lines after the chunk, so an edit to
+        # its last line can still account for what follows.
+        lookahead_lines = build_lookahead_lines(load_following_context_events(
+            session, file_id, content_type,
+            after_line=translate_to,
+            limit=ctx.options.lookahead_context_size,
+        ))
 
     editable = [
         e for e in tgt_snapshot
@@ -245,7 +241,7 @@ def polish_chunk(
         # Signs/lyrics have no CPS reading constraint — they are glanced at,
         # and short animation frames would yield absurd budgets.
         budget = (
-            _char_budget(e["start_ms"], e["end_ms"], cps_limit)
+            char_budget(e["start_ms"], e["end_ms"], cps_limit)
             if content_type == "dialogue" else None
         )
         budget_part = f" | max {budget} chars" if budget is not None else ""
@@ -254,6 +250,8 @@ def polish_chunk(
         lines.append(f"  DRAFT: {masked[e['line_index']].text}")
         for note in fix_notes.get(e["line_index"], []):
             lines.append(f"  fix: {note}")
+
+    lines += lookahead_lines
 
     user_parts = []
     if content_type == "dialogue":
@@ -268,6 +266,13 @@ def polish_chunk(
             style_block = build_style_block(style, speakers_present, identities)
             if style_block:
                 user_parts.append(f"## Style\n{style_block}")
+
+    # Distinctive established terms, for the drift check below. Short ones
+    # are skipped: they match inside other words and would only add noise.
+    glossary_targets = [
+        t.target_term for t in glossary_terms
+        if t.target_term and len(t.target_term) >= 3
+    ]
 
     glossary_block = build_glossary_block(
         glossary_terms, [e["source_text"] for e in editable])
@@ -318,6 +323,7 @@ def polish_chunk(
     editable_by_line = {e["line_index"]: e for e in editable}
     edits_applied = 0
     edits_skipped = 0
+    drift_flagged = 0
     audit_rows: list[dict] = []
     issue_rows: list[dict] = []
 
@@ -388,8 +394,30 @@ def polish_chunk(
             # The polished text is the AI pipeline's final output — keep the
             # revert-to-AI reference in sync with it.
             event.original_ai_translated_text = final_text
+            # The stored confidence was the cheap model's opinion of a draft
+            # that no longer exists; keeping it would have review_chunk_final
+            # flag (or clear) this line on a judgement of different text.
+            event.translation_confidence = None
             event.updated_at = now
             edits_applied += 1
+
+            # Nothing else in the pipeline checks that a polish rewrite
+            # preserved the meaning — validation is markup-only and the final
+            # review judges the result on its own, not against the draft.
+            for qa_type, message, details in check_polish_drift(
+                previous or "", final_text, reason, glossary_targets,
+            ):
+                drift_flagged += 1
+                issue_rows.append(dict(
+                    file_id=file_id,
+                    subtitle_event_id=e["id"],
+                    severity="warning" if content_type == "dialogue" else "info",
+                    qa_type=qa_type,
+                    message=message,
+                    details_json=json.dumps(details),
+                    is_resolved=0,
+                    created_at=now,
+                ))
             audit_rows.append(dict(
                 file_id=file_id,
                 subtitle_event_id=e["id"],
@@ -445,6 +473,7 @@ def polish_chunk(
             "edits_applied": edits_applied,
             "edits_skipped": edits_skipped,
             "issues_created": len(issue_rows),
+            "drift_flagged": drift_flagged,
             "targeted": targeted,
             "response_mode": stats.response_mode,
         },

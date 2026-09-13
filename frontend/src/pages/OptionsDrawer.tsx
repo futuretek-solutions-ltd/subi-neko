@@ -369,10 +369,18 @@ function OptionsForm({ options }: { options: OptionsMap }) {
         <SaveOnBlurNumber
           optionKey="PREPEND_CONTEXT_SIZE"
           label="Context lines"
-          description="Rolling context window: how many preceding subtitle lines (with their finished translations) each chunk sees. Translation is serialized per file so this context is usually already translated."
+          description="Rolling context window: how many preceding subtitle lines (with their finished translations) each chunk sees. Counted within the chunk's own kind of content, so interleaved signs and songs never eat into a dialogue chunk's window. Dialogue translation is serialized per file — a chunk starts only once the previous one is polished — so this context carries the final wording, not a draft."
           defaultValue={options['PREPEND_CONTEXT_SIZE'] ?? null}
           min={0}
           max={50}
+        />
+        <SaveOnBlurNumber
+          optionKey="LOOKAHEAD_CONTEXT_SIZE"
+          label="Lookahead lines"
+          description="How many lines following a chunk are shown to the translator and polish passes as untranslated English. Without it the last lines of every chunk are translated blind to what comes next. Counted within the chunk's own kind of content. Set to 0 to disable."
+          defaultValue={options['LOOKAHEAD_CONTEXT_SIZE'] ?? null}
+          min={0}
+          max={20}
         />
         <SaveOnBlurNumber
           optionKey="JOB_WORKER_COUNT"
@@ -436,6 +444,34 @@ function OptionsForm({ options }: { options: OptionsMap }) {
           description="Used for song lyrics (OP/ED/insert songs) instead of the dialogue prompt."
           defaultValue={options['SONG_TRANSLATION_PROMPT'] ?? null}
           onReset={() => resetPrompt('SONG_TRANSLATION_PROMPT')}
+        />
+        <SaveOnBlurTextarea
+          optionKey="ANALYZE_PROMPT"
+          label="Script analysis prompt"
+          description="Runs once per file before translation: produces the episode synopsis, scene segmentation, tricky-line notes, T–V address pairs and suggested glossary terms."
+          defaultValue={options['ANALYZE_PROMPT'] ?? null}
+          onReset={() => resetPrompt('ANALYZE_PROMPT')}
+        />
+        <SaveOnBlurTextarea
+          optionKey="MAPPING_PROMPT"
+          label="Speaker mapping prompt"
+          description="Matches raw subtitle speaker labels to characters from the metadata roster. Language-neutral — it does not use the target language placeholder."
+          defaultValue={options['MAPPING_PROMPT'] ?? null}
+          onReset={() => resetPrompt('MAPPING_PROMPT')}
+        />
+        <SaveOnBlurTextarea
+          optionKey="STYLE_BIBLE_PROMPT"
+          label="Style bible prompt"
+          description="Builds the project-level tone, register and honorific guidance, plus the initial glossary, character voices and address pairs."
+          defaultValue={options['STYLE_BIBLE_PROMPT'] ?? null}
+          onReset={() => resetPrompt('STYLE_BIBLE_PROMPT')}
+        />
+        <SaveOnBlurTextarea
+          optionKey="STYLE_BIBLE_UPDATE_PROMPT"
+          label="Style bible update prompt"
+          description="Runs after each accepted episode: captures only NEW terms, voices and address-pair changes from the finished translation."
+          defaultValue={options['STYLE_BIBLE_UPDATE_PROMPT'] ?? null}
+          onReset={() => resetPrompt('STYLE_BIBLE_UPDATE_PROMPT')}
         />
       </Section>
     </Stack>

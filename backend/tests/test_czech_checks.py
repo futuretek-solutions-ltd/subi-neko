@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from app.subs.czech_checks import (
+    check_addressee_gender_agreement,
     check_gender_agreement,
+    check_polish_drift,
     check_readability,
     check_tv_against_pairs,
     check_tv_mixed_in_line,
     check_untranslated_english,
     check_vocative,
+    infer_addressee,
 )
 
 
@@ -210,3 +213,136 @@ def test_untranslated_english_still_flags_verbatim_lyric():
     )
     assert findings
     assert findings[0][0] == "untranslated_english"
+
+
+# ---------------------------------------------------------------------------
+# Addressee inference
+# ---------------------------------------------------------------------------
+
+_FORMS = {"tomáš": "Tomáš", "tomáši": "Tomáš", "aria": "Aria", "ario": "Aria"}
+
+
+def test_infer_addressee_from_line_initial_address():
+    assert infer_addressee("Tomáši, pojď sem!", _FORMS) == "Tomáš"
+
+
+def test_infer_addressee_after_comma():
+    assert infer_addressee("Tak pojď, Ario.", _FORMS) == "Aria"
+
+
+def test_infer_addressee_ignores_name_as_subject():
+    # Talking ABOUT someone is not addressing them.
+    assert infer_addressee("Tomáš to včera viděl.", _FORMS) is None
+
+
+def test_infer_addressee_none_without_a_known_name():
+    assert infer_addressee("Pojď sem, kamaráde.", _FORMS) is None
+
+
+def test_infer_addressee_picks_the_earliest_address():
+    assert infer_addressee("Ario, řekni to Tomáši.", _FORMS) == "Aria"
+
+
+# ---------------------------------------------------------------------------
+# Second-person (addressee) gender agreement
+# ---------------------------------------------------------------------------
+
+def test_addressee_agreement_flags_masculine_form_for_female_addressee():
+    findings = check_addressee_gender_agreement("Kde jsi byl celou noc?", "female", "Aria")
+    assert findings
+    assert findings[0][0] == "gender_agreement"
+    assert findings[0][2]["person"] == "addressee"
+    assert findings[0][2]["addressee"] == "Aria"
+
+
+def test_addressee_agreement_flags_feminine_form_for_male_addressee():
+    findings = check_addressee_gender_agreement("Ty jsi to viděla.", "male")
+    assert findings
+
+
+def test_addressee_agreement_accepts_matching_form():
+    assert check_addressee_gender_agreement("Kde jsi byla celou noc?", "female") == []
+    assert check_addressee_gender_agreement("Byl bys rád.", "male") == []
+
+
+def test_addressee_agreement_ignores_unknown_gender():
+    assert check_addressee_gender_agreement("Kde jsi byl?", None) == []
+    assert check_addressee_gender_agreement("Kde jsi byl?", "unknown") == []
+
+
+def test_addressee_agreement_ignores_first_person_forms():
+    """The speaker's own past tense is the other check's business — a female
+    speaker saying "byla jsem" to a male addressee must not be flagged."""
+    assert check_addressee_gender_agreement("Byla jsem tam taky.", "male") == []
+
+
+def test_speaker_agreement_ignores_second_person_forms():
+    """...and symmetrically: "byl jsi" says nothing about the speaker."""
+    assert check_gender_agreement("Kde jsi byl?", "female") == []
+
+
+def test_agreement_sees_through_intervening_clitics():
+    """Ordinary Czech word order puts clitics between the auxiliary and the
+    participle. Matching only the adjacent case missed most real lines."""
+    assert check_gender_agreement("Já jsem to udělala.", "male")
+    assert check_gender_agreement("Nikdy jsem se jí nezeptala.", "male")
+    assert check_addressee_gender_agreement("Ty jsi mi to neřekla.", "male")
+    # ...without losing the precision guard.
+    assert check_gender_agreement("Ten stůl jsem koupila včera.", "female") == []
+    assert check_gender_agreement("Já jsem to udělal.", "male") == []
+
+
+# ---------------------------------------------------------------------------
+# Polish drift
+# ---------------------------------------------------------------------------
+
+def test_drift_flags_added_negation():
+    findings = check_polish_drift("Zvládnu to sám.", "Nezvládnu to sám.")
+    assert findings
+    assert findings[0][0] == "polish_drift"
+    assert "negation_changed" in findings[0][2]["reasons"]
+
+
+def test_drift_flags_changed_numbers():
+    findings = check_polish_drift("Musíme vydržet 12 dní.", "Musíme vydržet 13 dní.")
+    assert findings
+    assert "numbers_changed" in findings[0][2]["reasons"]
+
+
+def test_drift_flags_dropped_glossary_term():
+    findings = check_polish_drift(
+        "Aria to ví moc dobře.", "Ona to ví moc dobře.", None, ["Aria"])
+    assert findings
+    assert findings[0][2]["dropped_terms"] == ["Aria"]
+
+
+def test_drift_tolerates_inflected_glossary_term():
+    # Czech inflects names; the base form still prefixes the inflected one,
+    # so a normal case change must not read as a dropped term.
+    assert check_polish_drift(
+        "Viděl jsem Ariu včera večer.", "Ariu jsem viděl včera.", None, ["Aria"]) == []
+
+
+def test_drift_quiet_on_a_faithful_rewrite():
+    # Both keep exactly one negation and say the same thing.
+    assert check_polish_drift("Nevím, co mám dělat.", "Netuším, co dělat.") == []
+
+
+def test_drift_length_jump_not_reported_for_deliberate_condensing():
+    before = "Tohle je opravdu velmi dlouhá věta, která nic neříká."
+    after = "Zbytečná věta."
+    assert any("length_jump" in f[2]["reasons"]
+               for f in check_polish_drift(before, after))
+    # ...but the polish pass saying it condensed makes the change expected.
+    assert not any("length_jump" in f[2]["reasons"]
+                   for f in check_polish_drift(before, after, "length"))
+
+
+def test_drift_ignores_short_lines_and_markup():
+    assert check_polish_drift("Ano.", "Jo.") == []
+    assert check_polish_drift("{\\i1}Ano.{\\i0}", "{\\i1}Jo.{\\i0}") == []
+
+
+def test_drift_ignores_empty_sides():
+    assert check_polish_drift("", "Něco") == []
+    assert check_polish_drift("Něco", "") == []

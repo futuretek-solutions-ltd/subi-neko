@@ -32,7 +32,6 @@ from typing import Any
 from sqlalchemy import select
 
 from app.core.database import SyncSessionLocal
-from app.db.default_prompts import DEFAULT_MAPPING_PROMPT
 from app.db.models import Project, ProjectCharacter, ProjectSpeaker
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.registry import register_job_handler
@@ -250,7 +249,7 @@ def infer_character_mapping(
     if unresolved_snapshot and roster_snapshot:
         progress(0.4, f"LLM inference for {len(unresolved_snapshot)} speaker(s)")
 
-        lang_neutral_prompt = DEFAULT_MAPPING_PROMPT
+        lang_neutral_prompt = ctx.options.resolved_mapping_prompt().strip()
         speaker_lines = []
         for s in unresolved_snapshot:
             samples = "; ".join(f'"{line}"' for line in s["samples"][:5])

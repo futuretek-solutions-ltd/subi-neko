@@ -18,7 +18,7 @@ Extracts subtitles from MKV files, translates them using an OpenAI-compatible LL
   - **Translation** — cheap-model LLM translation with character context, per-line confidence, and structured (JSON-schema) outputs with automatic fallback for non-OpenAI backends
   - **Validation** — deterministic structural checks on the translated output
   - **Repair** — automated LLM repair pass when validation fails (one attempt before requiring user action)
-  - **Polish** — better-model full-coverage pass reworking every line for naturalness, gender agreement, register, and length
+  - **Polish** — better-model full-coverage pass reworking every line for naturalness, gender agreement, register, and length. Every edit is diffed against the draft (no extra LLM call): a rewrite that changes a number, flips a negation, or drops an established glossary term is flagged as `polish_drift` for review
   - **Final review** — deterministic Czech-agreement, T–V consistency, readability (CPS/row length), and untranslated-text checks; strong findings trigger one targeted polish re-pass
 - **Content-type aware** — dialogue, signs, songs, and karaoke get separate prompts and rules; karaoke lines keep their per-syllable timing untouched by default
 - **Series-wide consistency**:
@@ -97,11 +97,18 @@ Only the directory paths and low-level flags are set via environment variables (
 | `TARGET_LANG_CODE` | *(required)* | BCP-47 language code (e.g. `cs`) |
 | `CHUNK_SIZE` | `100` | Subtitle events per translation chunk |
 | `PREPEND_CONTEXT_SIZE` | `10` | Preceding events (with their translations) sent as read-only context |
+| `LOOKAHEAD_CONTEXT_SIZE` | `5` | Following events sent as read-only **untranslated** English, so the tail of a chunk isn't translated blind to what comes next (`0` disables) |
 | `TRANSLATION_PROMPT` | built-in | System prompt for the translation job; `{TARGET_LANG_NAME}` is substituted |
 | `REPAIR_PROMPT` | built-in | System prompt for the repair job |
 | `POLISH_PROMPT` | built-in | System prompt for the polish (naturalness) pass |
 | `SIGN_TRANSLATION_PROMPT` | built-in | System prompt for on-screen text (signs/typesetting) |
 | `SONG_TRANSLATION_PROMPT` | built-in | System prompt for song lyrics |
+| `ANALYZE_PROMPT` | built-in | System prompt for the per-file script analysis pass |
+| `MAPPING_PROMPT` | built-in | System prompt for speaker→character inference (language-neutral; no placeholder) |
+| `STYLE_BIBLE_PROMPT` | built-in | System prompt for building the project style bible |
+| `STYLE_BIBLE_UPDATE_PROMPT` | built-in | System prompt for the additive per-episode style-bible update |
+
+All prompt defaults live in `backend/app/db/default_prompts.py`; each is overridable live from the Options drawer, and clearing an option restores the built-in default.
 
 #### OpenAI / LLM
 
@@ -163,8 +170,9 @@ Once per project (from the first ready file):
 Once per file:
   └─ analyze_script       – synopsis, scenes, tricky-line notes, new terms/pairs
 
-Per chunk (translation serialized per file so later chunks see earlier
-translations as context; other stages overlap):
+Per chunk (dialogue translation serialized per file — dialogue chunk N starts
+only once chunk N-1 is polished, so later chunks see the final wording as
+context; signs/karaoke/songs and all later stages run in parallel):
   └─ translate_chunk     – cheap-model LLM translation (masked ASS tags,
   │                        per-line confidence, structured outputs)
   └─ validate_chunk      – deterministic structural validation

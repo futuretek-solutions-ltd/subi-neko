@@ -11,6 +11,7 @@ from app.jobs.handlers.validate_chunk import (
     _check_missing_translation,
     _check_locked_line_modified,
     _is_blocking,
+    _severity_for,
 )
 
 
@@ -255,6 +256,31 @@ def test_escape_mismatch_is_non_blocking():
     # text rewritten as prose) — it must surface for manual review but not
     # reject the event or trigger repair_chunk, unlike a real syntax defect.
     assert _is_blocking("escape_mismatch") is False
+
+
+def test_escape_mismatch_is_info_severity():
+    assert _severity_for("escape_mismatch") == "info"
+
+
+def test_blocking_types_get_blocker_severity():
+    assert _severity_for("formatting_tag_mismatch") == "blocker"
+
+
+def test_escape_mismatch_message_names_the_row_count_change():
+    # The message must state the real reason (line breaks reflowed, and to
+    # how many rows) instead of a generic "escape sequences not preserved".
+    issues = _check_escape_mismatch(
+        EventProxy(
+            translated_text="Jedna" + chr(92) + "NDva",
+            source_text="One" + chr(92) + "NTwo" + chr(92) + "NThree",
+        )  # type: ignore[arg-type]
+    )
+
+    assert len(issues) == 1
+    _, message, details = issues[0]
+    assert "2 rows instead of 3" in message
+    assert "escape sequences" not in message
+    assert details[chr(92) + "N"] == {"source": 2, "translated": 1}
 
 
 def test_other_check_types_remain_blocking():

@@ -154,23 +154,32 @@ def _check_formatting_tag_mismatch_relaxed(event: SubtitleEvent) -> list[tuple[s
 _ASS_ESCAPES = [r"\N", r"\n"]
 
 
+_ESCAPE_LABELS = {r"\N": r"hard breaks (\N)", r"\n": r"soft breaks (\n)"}
+
+
 def _check_escape_mismatch(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
     src = event.source_text or ""
     tgt = event.translated_text or ""
 
     details: dict[str, Any] = {}
-    failed = False
+    parts: list[str] = []
 
     for esc in _ASS_ESCAPES:
         src_count = src.count(esc)
         tgt_count = tgt.count(esc)
         if src_count != tgt_count:
             details[esc] = {"source": src_count, "translated": tgt_count}
-            failed = True
+            # Name the actual difference and the row count a reviewer sees on
+            # screen — this is a reflow notice, not a markup syntax defect.
+            parts.append(
+                f"{_ESCAPE_LABELS[esc]} {src_count} → {tgt_count}, "
+                f"rendering on {tgt_count + 1} rows instead of {src_count + 1}"
+            )
 
-    if failed:
+    if parts:
         return [("escape_mismatch",
-                 "ASS escape sequences were not preserved.",
+                 f"Translation reflowed the line breaks: {'; '.join(parts)}. "
+                 "Check that the on-screen layout still fits.",
                  details)]
     return []
 
@@ -226,9 +235,20 @@ def _is_json_output(text: str) -> bool:
 # AUTO_ACCEPT_POLICY (no_blockers) lets it through auto-accept too.
 _NON_BLOCKING_QA_TYPES = {"escape_mismatch"}
 
+# Severity for non-blocking types; anything not listed defaults to "warning".
+# A reflowed line is a notice about layout, not a defect in the translation,
+# so it lands at "info" — its message names the actual row-count change.
+_NON_BLOCKING_SEVERITY = {"escape_mismatch": "info"}
+
 
 def _is_blocking(qa_type: str) -> bool:
     return qa_type not in _NON_BLOCKING_QA_TYPES
+
+
+def _severity_for(qa_type: str) -> str:
+    if _is_blocking(qa_type):
+        return "blocker"
+    return _NON_BLOCKING_SEVERITY.get(qa_type, "warning")
 
 
 _CHECKS = [
@@ -355,7 +375,7 @@ def validate_chunk(
                 collected_errors.append(dict(
                     file_id=file_id,
                     subtitle_event_id=snap["id"],
-                    severity="blocker" if _is_blocking(qa_type) else "warning",
+                    severity=_severity_for(qa_type),
                     qa_type=qa_type,
                     message=message,
                     details_json=json.dumps(details) if details else None,

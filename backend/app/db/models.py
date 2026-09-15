@@ -597,8 +597,10 @@ class LlmCall(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    project_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    file_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    project_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
+    file_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("files.id", ondelete="CASCADE"), nullable=True)
     subtitle_chunk_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     task: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(Text, nullable=False)

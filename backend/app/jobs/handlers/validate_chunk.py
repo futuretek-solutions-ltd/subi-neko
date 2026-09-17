@@ -157,9 +157,12 @@ _ASS_ESCAPES = [r"\N", r"\n"]
 _ESCAPE_LABELS = {r"\N": r"hard breaks (\N)", r"\n": r"soft breaks (\n)"}
 
 
-def _check_escape_mismatch(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
-    src = event.source_text or ""
-    tgt = event.translated_text or ""
+def check_escape_mismatch(source_text: str, translated_text: str) -> list[tuple[str, str, dict]]:
+    """Shared with review_chunk_final, which re-runs this after auto line
+    breaking may have changed the row count validate_chunk originally saw.
+    """
+    src = source_text or ""
+    tgt = translated_text or ""
 
     details: dict[str, Any] = {}
     parts: list[str] = []
@@ -182,6 +185,10 @@ def _check_escape_mismatch(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
                  "Check that the on-screen layout still fits.",
                  details)]
     return []
+
+
+def _check_escape_mismatch(event: SubtitleEvent) -> list[tuple[str, str, dict]]:
+    return check_escape_mismatch(event.source_text, event.translated_text)
 
 
 def _check_locked_line_modified(event: SubtitleEvent) -> list[tuple[str, str, dict]]:

@@ -507,6 +507,7 @@ function FileRow({
   expanded,
   onEditSubtitles,
   onToggleExpanded,
+  onExpand,
 }: {
   file: VideoFile;
   projectId: number;
@@ -514,6 +515,7 @@ function FileRow({
   expanded: boolean;
   onEditSubtitles: (file: VideoFile) => void;
   onToggleExpanded: (fileId: number) => void;
+  onExpand: (fileId: number) => void;
 }) {
   const showEditButton = file.status === 'processing'
       || (file.status === 'waiting' && (file.blocking_reason === 'validation_failed' || file.blocking_reason === 'translation_failed' ))
@@ -584,6 +586,7 @@ function FileRow({
                   onClick={(e) => {
                     e.stopPropagation();
                     translateFile.mutate(file.id);
+                    onExpand(file.id);
                   }}
                 >
                   {analysisFailed ? 'Retry' : 'Translate'}
@@ -811,6 +814,10 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
       }
       return next;
     });
+  }
+
+  function handleExpandFile(fileId: number) {
+    setExpandedFileIds((prev) => (prev.has(fileId) ? prev : new Set(prev).add(fileId)));
   }
 
   function handleToggleAllFilesExpanded() {
@@ -1061,6 +1068,7 @@ function ProjectDetails({ project, onDeleted }: { project: Project; onDeleted: (
                   expanded={expandedFileIds.has(f.id)}
                   onEditSubtitles={setSubtitleEditorFile}
                   onToggleExpanded={handleToggleFileExpanded}
+                  onExpand={handleExpandFile}
                 />
               ))}
             </Table.Tbody>

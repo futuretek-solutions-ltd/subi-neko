@@ -241,7 +241,7 @@ def polish_chunk(
         # Signs/lyrics have no CPS reading constraint — they are glanced at,
         # and short animation frames would yield absurd budgets.
         budget = (
-            char_budget(e["start_ms"], e["end_ms"], cps_limit)
+            char_budget(e["start_ms"], e["end_ms"], cps_limit, e["source_text"])
             if content_type == "dialogue" else None
         )
         budget_part = f" | max {budget} chars" if budget is not None else ""

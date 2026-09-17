@@ -29,6 +29,7 @@ from app.db.models import (
 )
 from app.jobs.context import JobContext, JobResult, ProgressFn
 from app.jobs.handlers.prompt_context import build_speaker_identity_map, load_glossary_terms
+from app.jobs.handlers.validate_chunk import check_escape_mismatch
 from app.jobs.registry import register_job_handler
 from app.subs.czech_checks import (
     check_addressee_gender_agreement,
@@ -55,12 +56,14 @@ FINAL_REVIEW_QA_TYPES = {
     "too_many_rows",
     "untranslated_english",
     "low_confidence",
+    "escape_mismatch",
 }
 
 # Findings that route the chunk into the targeted polish re-pass.
 # low_confidence is triage information for the reviewer, not something a
-# blind re-polish can reliably fix.
-_STRONG_QA_TYPES = FINAL_REVIEW_QA_TYPES - {"low_confidence"}
+# blind re-polish can reliably fix; escape_mismatch is a layout notice about
+# a line-break count change, not a translation defect a re-polish would fix.
+_STRONG_QA_TYPES = FINAL_REVIEW_QA_TYPES - {"low_confidence", "escape_mismatch"}
 
 # One targeted polish re-pass: first review may send the chunk back, the
 # second review always lets it through.
@@ -275,9 +278,12 @@ def review_chunk_final(
         if vocatives:
             findings += check_vocative(translated, vocatives)
         findings += check_readability(translated, snap["end_ms"] - snap["start_ms"],
-                                      cps_limit, max_row_chars)
+                                      cps_limit, max_row_chars, snap["source_text"])
         findings += check_untranslated_english(
             snap["source_text"] or "", translated, english_exclude)
+        # Re-run after auto line breaking (above) so this reflects the row
+        # count actually shipped, not the pre-rebalance draft validate_chunk saw.
+        findings += check_escape_mismatch(snap["source_text"] or "", translated)
 
         confidence = snap["translation_confidence"]
         if confidence is not None and confidence < confidence_threshold:
@@ -293,7 +299,7 @@ def review_chunk_final(
             collected.append(dict(
                 file_id=file_id,
                 subtitle_event_id=snap["id"],
-                severity="warning",
+                severity="info" if qa_type == "escape_mismatch" else "warning",
                 qa_type=qa_type,
                 message=message,
                 details_json=json.dumps(details) if details else None,

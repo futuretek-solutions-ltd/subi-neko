@@ -237,11 +237,20 @@ def check_vocative(translated: str, vocatives: dict[str, str]) -> list[Finding]:
 # Readability — CPS, row length, row count
 # ---------------------------------------------------------------------------
 
+# Mirrors prompt_context.SOURCE_FLOOR_RATIO: a line isn't flagged (and
+# doesn't get routed into another forced re-polish) for running over the raw
+# CPS budget if it isn't actually longer than the English source needed in
+# the same slot — that's a timing quirk (often a sentence split across
+# several short events), not translated text that still has fat to cut.
+_SOURCE_FLOOR_RATIO = 0.9
+
+
 def check_readability(
     translated: str,
     duration_ms: int,
     cps_limit: float,
     max_row_chars: int,
+    source_text: str | None = None,
 ) -> list[Finding]:
     findings: list[Finding] = []
     rows = [plain_text(part) for part in re.split(r"\\N", translated or "")]
@@ -251,12 +260,17 @@ def check_readability(
         cps = len(visible) / (duration_ms / 1000.0)
         if cps > cps_limit:
             budget = int(cps_limit * duration_ms / 1000.0)
-            findings.append((
-                "high_cps",
-                f"Reading speed {cps:.1f} CPS exceeds limit {cps_limit:.0f} "
-                f"(fits in ~{budget} chars).",
-                {"cps": round(cps, 1), "limit": cps_limit, "char_budget": budget},
-            ))
+            protected_budget = budget
+            if source_text:
+                source_floor = int(len(plain_text(source_text)) * _SOURCE_FLOOR_RATIO)
+                protected_budget = max(budget, source_floor)
+            if len(visible) > protected_budget:
+                findings.append((
+                    "high_cps",
+                    f"Reading speed {cps:.1f} CPS exceeds limit {cps_limit:.0f} "
+                    f"(fits in ~{protected_budget} chars).",
+                    {"cps": round(cps, 1), "limit": cps_limit, "char_budget": protected_budget},
+                ))
 
     long_rows = [row for row in rows if len(row) > max_row_chars]
     if long_rows:
@@ -362,14 +376,45 @@ def check_untranslated_english(
 
 _DIGIT_RUN_RE = re.compile(r"\d+")
 
-# Czech negation is overwhelmingly the verbal prefix "ne-", plus a small set
-# of negative pronouns/adverbs. Counting occurrences is a coarse but stable
-# proxy: a genuine rephrasing usually preserves the count ("Nevím" ->
-# "Netuším"), while dropping or adding a negation changes it.
-_NEGATION_RE = re.compile(
-    r"\b(?:ne\w+|ne|ni(?:kdy|c|kdo|jak|kam|kde)|ani|žádn\w*)\b",
+# Negative pronouns/adverbs and the bare particle "ne" ("no"): a small,
+# closed set that isn't usually swapped for an unrelated positive synonym,
+# so counting their occurrences is a reasonably clean signal on its own.
+_NEGATIVE_CLOSED_RE = re.compile(
+    r"\b(?:ne|ni(?:kdy|c|kdo|jak|kam|kde)|ani|žádn\w*)\b",
     re.IGNORECASE | re.UNICODE,
 )
+
+# Productive verbal/adjectival "ne-" prefix. A raw count of these words is
+# noisy on its own: "ne\w+" also matches ordinary vocabulary that merely
+# starts with "ne" (nebo, nebe, nervy, netopýr), and even restricted to true
+# negations, Czech frequently carries the same polarity through an unrelated
+# word on the other side of a polish edit ("je zbytečné" <-> "je to únavné"
+# vs "netřeba" — no meaning change, different lexeme). What IS diagnostic of
+# an actual flip is the same word root gaining or losing the prefix between
+# the two versions ("vím" -> "nevím"), so that's what _negation_flip checks
+# instead of a bare count.
+_NEG_PREFIX_WORD_RE = re.compile(r"\bne(\w{2,})\b", re.IGNORECASE | re.UNICODE)
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _negation_flip(old: str, new: str) -> bool:
+    """True if some word's polarity plausibly flipped between old and new —
+    the same root gained or lost its "ne-" negation — rather than the text
+    merely switching to a different, unrelated word or phrase.
+    """
+    old_words = {w.casefold() for w in _WORD_RE.findall(old)}
+    new_words = {w.casefold() for w in _WORD_RE.findall(new)}
+
+    old_stems = {m.group(1).casefold() for m in _NEG_PREFIX_WORD_RE.finditer(old)}
+    new_stems = {m.group(1).casefold() for m in _NEG_PREFIX_WORD_RE.finditer(new)}
+
+    # Negation dropped: "ne<stem>" in old, bare "<stem>" now in new.
+    if any(stem in new_words for stem in old_stems - new_stems):
+        return True
+    # Negation added: bare "<stem>" in old, "ne<stem>" now in new.
+    if any(stem in old_words for stem in new_stems - old_stems):
+        return True
+    return False
 
 # Below this many visible characters, a large relative length change is not
 # evidence of anything — one word in a three-word line moves it.
@@ -398,11 +443,11 @@ def check_polish_drift(
         reasons.append("numbers_changed")
         details["numbers"] = {"before": old_digits, "after": new_digits}
 
-    old_neg = len(_NEGATION_RE.findall(old))
-    new_neg = len(_NEGATION_RE.findall(new))
-    if old_neg != new_neg:
+    old_closed_neg = len(_NEGATIVE_CLOSED_RE.findall(old))
+    new_closed_neg = len(_NEGATIVE_CLOSED_RE.findall(new))
+    if old_closed_neg != new_closed_neg or _negation_flip(old, new):
         reasons.append("negation_changed")
-        details["negation_count"] = {"before": old_neg, "after": new_neg}
+        details["negation_count"] = {"before": old_closed_neg, "after": new_closed_neg}
 
     dropped = [
         term for term in (glossary_targets or [])

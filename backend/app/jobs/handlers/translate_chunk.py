@@ -377,7 +377,8 @@ def translate_chunk(
         budgets: dict[int, int] = {}
         if content_type == "dialogue":
             for e in tgt_snapshot:
-                budget = char_budget(e["start_ms"], e["end_ms"], ctx.options.cps_limit)
+                budget = char_budget(
+                    e["start_ms"], e["end_ms"], ctx.options.cps_limit, e["source_text"])
                 if budget is not None:
                     budgets[e["line_index"]] = budget
 
